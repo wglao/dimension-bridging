@@ -14,7 +14,7 @@ COPY ./code ./code
 COPY ./data ./data
 RUN chmod +rx ./code/dba/*.py
 
-ENV PATH "./code/dba:$PATH"
+ENV PATH "/app/code/dba:$PATH"
 
 # Install node packages, install serve, build the app, and remove dependencies at the end
 RUN apt update\
@@ -46,8 +46,8 @@ RUN sudo apt install libcudnn8=8.9.2.*-1+cuda12.1\
 # Python environment
 RUN python3.10 -m venv jax-env
 
-ENV VIRTUAL_ENV "jax-env/"
-ENV PATH "jax-env/bin:$PATH"
+ENV VIRTUAL_ENV "/app/jax-env/"
+ENV PATH "/app/jax-env/bin:$PATH"
 
 RUN pip install --upgrade pip wheel\
     && pip install --upgrade numpy pandas scipy matplotlib wandb plotly\
