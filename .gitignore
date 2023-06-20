@@ -5,3 +5,4 @@ submit
 db-env
 *.vtk
 data
+*.tar*
