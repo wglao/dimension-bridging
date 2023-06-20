@@ -17,29 +17,31 @@ RUN chmod +rx ./code/dba/*.py
 ENV PATH "./code/dba:$PATH"
 
 # Install node packages, install serve, build the app, and remove dependencies at the end
-RUN apt-get update\
-    && apt-get -y install sudo\
-    && apt-get upgrade -y
+RUN apt update\
+    && apt -y install sudo\
+    && apt upgrade -y
+
+# python
+RUN sudo apt -y install python3.10\
+    && sudo apt -y install python3-pip\
+    && sudo apt -y install python3-venv
 
 # dependencies
-RUN sudo apt install python3.10\
-    && sudo apt install python3-pip\
-    && sudo apt install python3-venv\
-    && sudo apt install git\
-    && sudo apt install wget\
-    && sudo apt install nvidia-525\
-    && sudo apt-get install zlib1g
+RUN sudo apt -y install git\
+    && sudo apt -y install wget\
+    && sudo apt -y install nvidia-driver-525\
+    && sudo apt -y install zlib1g
 
 # CUDA
 RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.0-1_all.deb\
     && sudo dpkg -i cuda-keyring_1.0-1_all.deb\
-    && sudo apt-get update\
-    && sudo apt-get -y install cuda
+    && sudo apt update\
+    && sudo apt -y install cuda
 
 # CUDNN
-RUN sudo apt-get install libcudnn8=8.9.2.*-1+cuda12.1\
-    && sudo apt-get install libcudnn8-dev=8.9.2.*-1+cuda12.1\
-    && sudo apt-get install libcudnn8-samples=8.9.2.*-1+cuda12.1
+RUN sudo apt install libcudnn8=8.9.2.*-1+cuda12.1\
+    && sudo apt install libcudnn8-dev=8.9.2.*-1+cuda12.1\
+    && sudo apt install libcudnn8-samples=8.9.2.*-1+cuda12.1
 
 # Python environment
 RUN python3.10 -m venv jax-env\
