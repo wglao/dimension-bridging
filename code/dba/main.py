@@ -44,7 +44,7 @@ train_adj_2 = []
 for ma in ma_list:
   for re in re_list:
     for a in a_list:
-      path = "/scratch1/07169/wgl/ORNL/2d3d/data/ma_{:g}/re_{:g}/a_{:g}".format(
+      path = "../data/ma_{:g}/re_{:g}/a_{:g}".format(
           ma, re, a)
       mesh_3 = pv.read(os.path.join(path, "flow.vtu"))
 
@@ -80,7 +80,7 @@ del mesh_2
 # train_data_3 = jnp.array(train_data_3)    #[Batches, Nodes, Fields]
 # train_data_2 = jnp.array(train_data_2)    #[Batches, Slices, Nodes, Fields]
 
-test_path = "/scratch1/07169/wgl/ORNL/2d3d/data/ma_{:g}/re_{:g}/a_{:g}".format(
+test_path = "../data/ma_{:g}/re_{:g}/a_{:g}".format(
     0.8395, 1.172e7, 3.06)
 test_mesh_3 = pv.read(os.path.join(test_path, "flow.vtu"))
 test_data_3 = jnp.column_stack([[
