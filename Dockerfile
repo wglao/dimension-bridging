@@ -10,11 +10,11 @@ WORKDIR /app
 # # Copy local directories to the current local directory of our docker image (/app)
 # COPY ./src ./src
 # COPY ./public ./public
-COPY ./code ./code
-COPY ./data ./data
-RUN chmod +rx ./code/dba/*.py
+# COPY ./code ./code
+# COPY ./data ./data
+# RUN chmod +rx ./code/dba/*.py
 
-ENV PATH "/app/code/dba:$PATH"
+# ENV PATH "/app/code/dba:$PATH"
 
 # Install node packages, install serve, build the app, and remove dependencies at the end
 RUN apt update\
@@ -58,4 +58,4 @@ RUN pip install --upgrade pip wheel\
 EXPOSE 3000
 
 # Start the app
-CMD ["python", "main.py","-h"]
+CMD ["python -c 'import jax; jax.devices()' "]
