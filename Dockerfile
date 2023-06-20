@@ -44,15 +44,18 @@ RUN sudo apt install libcudnn8=8.9.2.*-1+cuda12.1\
     && sudo apt install libcudnn8-samples=8.9.2.*-1+cuda12.1
 
 # Python environment
-RUN python3.10 -m venv jax-env\
-    && source jax-env/bin/activate\
-    && pip install --upgrade --no-cache-dir pip wheel\
-    && pip install --upgrade --no-cache-dir numpy pandas scipy matplotlib wandb plotly\
-    && pip install --upgrade --no-cache-dir "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html\
-    && pip install --upgrade --no-cache-dir flax\
-    && pip install --upgrade --no-cache-dir pyvista[all]
+RUN python3.10 -m venv jax-env
+
+ENV VIRTUAL_ENV "jax-env/"
+ENV PATH "jax-env/bin:$PATH"
+
+RUN pip install --upgrade pip wheel\
+    && pip install --upgrade numpy pandas scipy matplotlib wandb plotly\
+    && pip install --upgrade "jax[cuda12_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html\
+    && pip install --upgrade flax\
+    && pip install --upgrade pyvista[all]
 
 EXPOSE 3000
 
 # Start the app
-CMD [ "main.py","-h"]
+CMD ["python", "main.py","-h"]
