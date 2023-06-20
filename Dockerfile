@@ -12,8 +12,8 @@ WORKDIR /app
 # COPY ./public ./public
 COPY ./code ./code
 COPY ./data ./data
-RUN chmod +rx ./code/*.py
-RUN chmod +rx ./code/*/*.py
+RUN chmod +rx ./code/*.py\
+    && chmod +rx ./code/*/*.py
 
 ENV PATH "./code/dba:$PATH"
 
