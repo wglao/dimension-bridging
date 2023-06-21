@@ -33,17 +33,17 @@ args = parser.parse_args()
 wandb_upload = bool(args.wandb)
 
 # loop through folders and load data
-ma_list = [0.2, 0.35, 0.5, 0.65, 0.8, 0.95, 1.1]
+ma_list = [0.2, 0.35, 0.5, 0.65, 0.8]
 re_list = [1e5, 1e6, 1e7, 1e8]
 aoa_list = [0, 2, 4, 6, 8, 10, 12]
 n_slices = 5
-data_path = "../../data/"
+data_path = "data"
 
 train_dataset = GraphDataset(data_path, ma_list, re_list, aoa_list, n_slices)
 test_dataset = GraphDataset(data_path, [0.8395], [1.172e7], [3.06], n_slices)
 
 n_samples = len(ma_list)*len(re_list)*len(aoa_list)
-batch_sz = 10
+batch_sz = 1
 batches = -(n_samples // -batch_sz)
 test_sz = 1
 
@@ -51,17 +51,19 @@ train_dataloader = DataLoader(train_dataset, batch_sz, shuffle=True)
 test_dataloader = DataLoader(test_dataset, test_sz, shuffle=True)
 
 rng = jrn.PRNGKey(1)
-
 n_pools = args.pooling_layers
+
+init_data_3, init_adj_3, init_data_2, init_adj_2 = [i[0] for i in next(iter(train_dataloader))]
+
 ge_3 = GraphEncoder(n_pools, args.latent_sz, args.channels, dim=3)
 ge_2 = GraphEncoder(n_pools, args.latent_sz, args.channels, dim=2)
-final_sz = len(train_data_3[0, 0]) - 3
+final_sz = len(init_data_3) - 3
 gd = GraphDecoder(n_pools, final_sz, args.channels, dim=3)
 
-pe_3 = ge_3.init(rng, train_data_3[0], train_adj_3[0])['params']
-pe_2 = ge_2.init(rng, train_data_2[0], train_adj_2[0])['params']
-f_latent, a, c, s = ge_3.apply({'params': pe_3}, train_data_3[0],
-                               train_adj_3[0])
+pe_3 = ge_3.init(rng, init_data_3, init_adj_3)['params']
+pe_2 = ge_2.init(rng, init_data_2, init_adj_2)['params']
+f_latent, a, c, s = ge_3.apply({'params': pe_3}, init_data_3,
+                               init_adj_3)
 pd = gd.init(rng, f_latent, a, c, s)['params']
 params = [pe_3, pe_2, pd]
 tx = optax.adam(1e-3)
@@ -71,16 +73,13 @@ n_epochs = 100000
 eps = 1e-15
 
 
-@jit
+# @jit
 def train_step(params,
-               features_3,
-               features_2,
-               adjacency_3,
-               adjacency_2,
+               dataloader,
                opt: optax.OptState,
                lam_2: float = 1,
                lam_dp: float = 1):
-
+  @jit
   def loss_fn(params, features_3, features_2, adjacency_3, adjacency_2):
     loss = 0
     for fb3, fb2 in zip(features_3, features_2):
@@ -102,30 +101,35 @@ def train_step(params,
       loss = loss + (loss_ae + lam_2*loss_2 + lam_dp*
                      (loss_e+loss_lp)) / batch_sz
     return loss
-
-  def get_acs(params, features_3):
-    a_list = []
-    c_list = []
-    s_list = []
-    for fb3 in jnp.concatenate(features_3):
-      _, a, c, s = ge_3.apply({'params': params[0]}, fb3, adjacency_3)
-      if a_list == []:
-        a_list = jtr.tree_map(lambda a: a / batches / batch_sz, a)
-        c_list = jtr.tree_map(lambda c: c / batches / batch_sz, c)
-        s_list = jtr.tree_map(lambda s: s / batches / batch_sz, s)
-      else:
-        a_list = jtr.tree_map(lambda a, a_new: a + a_new/batches/batch_sz,
-                              a_list, a)
-        c_list = jtr.tree_map(lambda c, c_new: c + c_new/batches/batch_sz,
-                              c_list, c)
-        s_list = jtr.tree_map(lambda s, s_new: s + s_new/batches/batch_sz,
-                              s_list, s)
-    return a, c, s
+  
+  # @jit
+  # def get_acs(params, features_3, adjacency_3):
+  #   a_list = []
+  #   c_list = []
+  #   s_list = []
+  #   for fb3 in jnp.concatenate(features_3):
+  #     _, a, c, s = ge_3.apply({'params': params[0]}, fb3, adjacency_3)
+  #     if a_list == []:
+  #       a_list = jtr.tree_map(lambda a: a / batches / batch_sz, a)
+  #       c_list = jtr.tree_map(lambda c: c / batches / batch_sz, c)
+  #       s_list = jtr.tree_map(lambda s: s / batches / batch_sz, s)
+  #     else:
+  #       a_list = jtr.tree_map(lambda a, a_new: a + a_new/batches/batch_sz,
+  #                             a_list, a)
+  #       c_list = jtr.tree_map(lambda c, c_new: c + c_new/batches/batch_sz,
+  #                             c_list, c)
+  #       s_list = jtr.tree_map(lambda s, s_new: s + s_new/batches/batch_sz,
+  #                             s_list, s)
+  #   return a, c, s
 
   loss = 0
-  for batch_3, batch_2 in zip(features_3, features_2):
-    batch_loss, grads = value_and_grad(loss_fn)(params, batch_3, batch_2,
-                                                adjacency_3, adjacency_2)
+  a_list = []
+  c_list = []
+  s_list = []
+  for batch in range(batches):
+    data_3, adj_3, data_2, adj_2 = next(iter(dataloader))
+    batch_loss, grads = value_and_grad(loss_fn)(params, data_3, data_2,
+                                                adj_3, adj_2)
     # grads = grad(loss_fn)(params, features, adjacency)
     updates, opt = tx.update(grads, opt, params)
     params = optax.apply_updates(params, updates)
@@ -147,14 +151,26 @@ def train_step(params,
       params[i] = fd.freeze(p)
 
     loss = loss + batch_loss/batches
-  a, c, s = get_acs(params, features_3)
-  return loss, params, opt, a, c, s
+    _, a, c, s = ge_3.apply({'params': params[0]}, data_3, adj_3)
+    if a_list == []:
+      a_list = jtr.tree_map(lambda a: a / batches / batch_sz, a)
+      c_list = jtr.tree_map(lambda c: c / batches / batch_sz, c)
+      s_list = jtr.tree_map(lambda s: s / batches / batch_sz, s)
+    else:
+      a_list = jtr.tree_map(lambda a, a_new: a + a_new/batches/batch_sz,
+                            a_list, a)
+      c_list = jtr.tree_map(lambda c, c_new: c + c_new/batches/batch_sz,
+                            c_list, c)
+      s_list = jtr.tree_map(lambda s, s_new: s + s_new/batches/batch_sz,
+                            s_list, s)
+  
+  return loss, params, opt
 
 
-@jit
-def test_step(params, features_3, features_2, adjacency_2, adjacency_list,
+# @jit
+def test_step(params, dataloader, adjacency_list,
               coordinates, selection):
-
+  @jit
   def loss_fn(params, features_3, features_2, adjacency_2, adjacency_list,
               coordinates, selection):
     loss = 0
@@ -166,31 +182,31 @@ def test_step(params, features_3, features_2, adjacency_2, adjacency_list,
       loss = loss + loss_ae/test_sz
     return loss
 
-  test_err = loss_fn(params, features_3, features_2, adjacency_2,
+  test_err = 0
+  for batch in range(test_dataset.items):
+    data_3, adj_3, data_2, adj_2 = next(iter(dataloader))
+    sample_err = loss_fn(params, data_3, data_2, adj_2,
                      adjacency_list, coordinates, selection)
   return test_err
 
 
-def getBatchIndices(indices, i):
-  batch_indices = dsd(indices, i, batch_sz)
-  return indices, batch_indices
+# def getBatchIndices(indices, i):
+#   batch_indices = dsd(indices, i, batch_sz)
+#   return indices, batch_indices
 
+    # # shuffle batches
+    # batch_indices = scan(getBatchIndices,
+    #                      jrn.shuffle(jrn.PRNGKey(epoch), indices),
+    #                      jnp.arange(batches))
 
 def main(params, n_epochs):
   opt = tx.init(params)
-  indices = jnp.arange(len(train_data_3))
+  # indices = train_dataset.items
   for epoch in range(n_epochs):
-    # shuffle batches
-    batch_indices = scan(getBatchIndices,
-                         jrn.shuffle(jrn.PRNGKey(epoch), indices),
-                         jnp.arange(batches))
     loss, params, opt, a, c, s = train_step(
-        params, [train_data_3[i] for i in batch_indices],
-        [train_data_2[i] for i in batch_indices],
-        [train_adj_3[i] for i in batch_indices],
-        [train_adj_2[i] for i in batch_indices], opt, args.lambda_2d,
+        params, train_dataloader, opt, args.lambda_2d,
         args.lambda_dp)
-    test_err = test_step(params, test_data_3, test_data_2, test_adj_2, a, c, s)
+    test_err = test_step(params, test_dataloader, a, c, s)
     if epoch % 100 == 0 or epoch == n_epochs - 1:
       if wandb_upload:
         wandb.log({

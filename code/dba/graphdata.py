@@ -50,22 +50,22 @@ class GraphDataset(data.Dataset):
     self.re_list = re_list
     self.aoa_list = aoa_list
     self.n_slices = n_slices
-    self.items = 0
+    self.items = len(ma_list)*len(re_list)*len(aoa_list)
 
   def __len__(self):
     return self.items
 
   def __getitem__(self, index):
     ma = self.ma_list[index // (len(self.re_list)*len(self.aoa_list))]
-    re = self.re_list[(index // len(self.aoa)) % len(self.re_list)]
+    re = self.re_list[(index // len(self.aoa_list)) % len(self.re_list)]
     a = self.aoa_list[index % len(self.aoa_list)]
     data_path = os.path.join(self.data_dir,
                              "ma_{:g}/re_{:g}/a_{:g}".format(ma, re, a))
 
     mesh = pv.read(os.path.join(data_path, "flow.vtu"))
     # extract point data from coordinates and conservative fields
-    coords = jnp.array(mesh.points)
-    train_data_3 = jnp.column_stack([coords] + [
+    coords = np.array(mesh.points)
+    train_data_3 = np.column_stack([coords] + [
         mesh.point_data.get_array(i)
         for i in ["Density", "Momentum", "Energy"]
     ])
@@ -76,11 +76,29 @@ class GraphDataset(data.Dataset):
     slice_adj = []
     for s in range(self.n_slices):
       mesh = pv.read(os.path.join(data_path, "slice_{:d}.vtk".format(s)))
-      slice_data.append(jnp.column_stack([coords] + [
+      slice_data.append(np.column_stack([coords] + [
         mesh.point_data.get_array(i)
         for i in ["Density", "Momentum", "Energy"]
       ]))
       slice_adj.append(v2a(mesh))
-    train_data_2 = jnp.concatenate(slice_data, axis=0)
+    train_data_2 = np.concatenate(slice_data, axis=0)
     train_adj_2 = combineAdjacency(slice_adj)
     return train_data_3, train_adj_3, train_data_2, train_adj_2
+  
+if __name__ == "__main__":
+  ma_list = [0.2, 0.35, 0.5, 0.65, 0.8]
+  re_list = [1e5, 1e6, 1e7, 1e8]
+  aoa_list = [0, 2, 4, 6, 8, 10, 12]
+  n_slices = 5
+  data_path = "data"
+
+  train_dataset = GraphDataset(data_path, ma_list, re_list, aoa_list, n_slices)
+
+  n_samples = len(ma_list)*len(re_list)*len(aoa_list)
+  batch_sz = 1
+  batches = -(n_samples // -batch_sz)
+
+  train_dataloader = data.DataLoader(train_dataset, batch_sz, shuffle=True)
+
+  print(next(iter(train_dataloader)))
+  breakpoint()
