@@ -164,7 +164,7 @@ def train_step(params,
       s_list = jtr.tree_map(lambda s, s_new: s + s_new/batches/batch_sz,
                             s_list, s)
   
-  return loss, params, opt
+  return loss, params, opt, a_list, c_list, s_list
 
 
 # @jit
