@@ -48,10 +48,18 @@ def combineAdjacency(*adjs):
 
   buffer = jnp.cumsum(in_szs)
   adjacency.indices = jnp.concatenate(
-      [a.indices + jnp.array([b, b]) for a, b in zip(adjs, buffer)])
+      [a.indices + jnp.array([b, b]) for a, b in zip(adjs, buffer)], axis=None)
+  adjacency.data = jnp.concatenate([jnp.zeros_like(adjacency.data)]+[a.data for a in adjs], axis=None)
+  adjacency = adjacency.sum_duplicates()
+  # adjacency.data = jnp.ones((adjacency.indices.shape[0],))
+
+  return adjacency
 
 
 if __name__ == "__main__":
-  fname = "data/ma_0.2/re_1e+08/a_0/" + args.file
-  mesh = pv.read(fname)
-  a = v2a(mesh)
+  adj_list = []
+  for s in range(5):
+    fname = "data/ma_0.2/re_1e+08/a_0/slice_{:d}.vtk".format(s)
+    mesh = pv.read(fname)
+    adj_list.append(v2a(mesh))
+  a = combineAdjacency(*adj_list)
