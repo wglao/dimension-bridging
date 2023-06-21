@@ -30,7 +30,8 @@ ENV VIRTUAL_ENV "/app/jax-env/"
 ENV PATH "/app/jax-env/bin:$PATH"
 
 RUN pip install --upgrade pip wheel\
-    && pip install --upgrade --no-cache-dir numpy pandas scipy matplotlib wandb plotly torch torchvision\
+    && pip install --upgrade --no-cache-dir numpy pandas scipy matplotlib wandb plotly\
+    && pip install --upgrade --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118\
     && pip install --upgrade --no-cache-dir "jax[cuda11_pip]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html\
     && pip install --upgrade --no-cache-dir flax\
     && pip install --upgrade pyvista[all]
