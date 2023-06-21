@@ -7,7 +7,6 @@ from jax.lax import dynamic_index_in_dim as did
 import numpy as np
 import pandas as pd
 import jax.experimental.sparse as jxs
-import jax.scipy.sparse as jsps
 import pyvista as pv
 
 import argparse
@@ -40,6 +39,16 @@ def v2a(mesh):
   adjacency.data = jnp.ones_like(adjacency.data)
 
   return adjacency
+
+
+def combineAdjacency(*adjs):
+  in_szs = jnp.array([a.shape[0] for a in adjs])
+  out_sz = jnp.sum(in_szs)
+  adjacency = jxs.eye(out_sz)
+
+  buffer = jnp.cumsum(in_szs)
+  adjacency.indices = jnp.concatenate(
+      [a.indices + jnp.array([b, b]) for a, b in zip(adjs, buffer)])
 
 
 if __name__ == "__main__":
