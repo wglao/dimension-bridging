@@ -53,7 +53,8 @@ test_dataloader = DataLoader(test_dataset, test_sz, shuffle=True)
 rng = jrn.PRNGKey(1)
 n_pools = args.pooling_layers
 
-init_data_3, init_adj_3, init_data_2, init_adj_2 = [i[0] for i in next(iter(train_dataloader))]
+# init_data_3, init_adj_3, init_data_2, init_adj_2 = [i[0] for i in next(iter(train_dataloader))]    # -> batch > 1
+init_data_3, init_adj_3, init_data_2, init_adj_2 = next(iter(train_dataloader))
 
 ge_3 = GraphEncoder(n_pools, args.latent_sz, args.channels, dim=3)
 ge_2 = GraphEncoder(n_pools, args.latent_sz, args.channels, dim=2)
