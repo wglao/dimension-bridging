@@ -38,4 +38,4 @@ RUN pip install --upgrade pip wheel\
 EXPOSE 3000
 
 # Start the app
-CMD ["nvidia-smi;","/app/jax-env/bin/python -c 'import jax; print(jax.__version__); print(jax.devices())'"]
+CMD ["nvidia-smi"]
