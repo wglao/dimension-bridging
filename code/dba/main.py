@@ -37,7 +37,7 @@ ma_list = [0.2, 0.35, 0.5, 0.65, 0.8]
 re_list = [1e5, 1e6, 1e7, 1e8]
 aoa_list = [0, 2, 4, 6, 8, 10, 12]
 n_slices = 5
-data_path = "/scratch1/07169/wgl/dimension-bridging/data"
+data_path = "/scratch1/07169/wgl/ORNL/dimension-bridging/data"
 
 train_dataset = GraphDataset(data_path, ma_list, re_list, aoa_list, n_slices)
 test_dataset = GraphDataset(data_path, [0.8395], [1.172e7], [3.06], n_slices)
