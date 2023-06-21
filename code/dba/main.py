@@ -14,9 +14,11 @@ from jax.lax import dynamic_slice_in_dim as dsd
 from jax.lax import scan
 import jax.experimental.sparse as jxs
 import pyvista as pv
+from torch.utils.data import DataLoader
 
 from models import GraphDecoder, GraphEncoder
-from vtk2adj import v2a
+from graphdata import GraphDataset
+from vtk2adj import v2a, combineAdjacency
 
 parser = argparse.ArgumentParser()
 
@@ -33,82 +35,20 @@ wandb_upload = bool(args.wandb)
 # loop through folders and load data
 ma_list = [0.2, 0.35, 0.5, 0.65, 0.8, 0.95, 1.1]
 re_list = [1e5, 1e6, 1e7, 1e8]
-a_list = [0, 2, 4, 6, 8, 10, 12]
+aoa_list = [0, 2, 4, 6, 8, 10, 12]
 n_slices = 5
+data_path = "../../data/"
 
-train_data_3 = []
-train_data_2 = []
-train_adj_3 = []
-train_adj_2 = []
+train_dataset = GraphDataset(data_path, ma_list, re_list, aoa_list, n_slices)
+test_dataset = GraphDataset(data_path, [0.8395], [1.172e7], [3.06], n_slices)
 
-for ma in ma_list:
-  for re in re_list:
-    for a in a_list:
-      path = "../../data/ma_{:g}/re_{:g}/a_{:g}".format(ma, re, a)
-      mesh_3 = pv.read(os.path.join(path, "flow.vtu"))
-
-      # extract point data from coordinates and conservative fields
-      coords_3 = jnp.array(mesh_3.points)
-      train_data_3.append(
-          jnp.column_stack(
-              [coords_3] +
-              # [mesh_3.point_data.get_array(i) for i in range(mesh_3.n_arrays)]))
-              [
-                  mesh_3.point_data.get_array(i)
-                  for i in ["Density", "Momentum", "Energy"]
-              ]))
-      train_adj_3.append(v2a(mesh_3))
-
-      slice_data = []
-      slice_adj = []
-      for i in range(n_slices):
-        mesh_2 = pv.read(os.path.join(path, "slice_{:g}.vtk".format(i)))
-        coords_2 = jnp.array(mesh_2.points)
-        slice_data.append(
-            jnp.column_stack([coords_2] + [
-                # mesh_2.point_data.get_array(i) for i in range(mesh_2.n_arrays)
-                mesh_2.point_data.get_array(i)
-                for i in ["Density", "Momentum", "Energy"]
-            ]))
-        slice_adj.append(v2a(mesh_2))
-      train_data_2.append(slice_data)
-      train_adj_2.append(slice_adj)
-
-del mesh_3
-del mesh_2
-
-# train_data_3 = jnp.array(train_data_3)    #[Batches, Nodes, Fields]
-# train_data_2 = jnp.array(train_data_2)    #[Batches, Slices, Nodes, Fields]
-
-test_path = "../../data/ma_{:g}/re_{:g}/a_{:g}".format(0.8395, 1.172e7, 3.06)
-test_mesh_3 = pv.read(os.path.join(test_path, "flow.vtu"))
-coords_3 = jnp.array(mesh_3.points)
-test_data_3 = jnp.column_stack([coords_3] + [
-    # test_mesh_3.point_data.get_array(i) for i in range(test_mesh_3.n_arrays)
-    test_mesh_3.point_data.get_array(i)
-    for i in ["Density", "Momentum", "Energy"]
-])
-# test_adj_3 = v2a(test_mesh_3)
-
-test_data_2 = []
-test_adj_2 = []
-for i in range(n_slices):
-  test_mesh_2 = pv.read(os.path.join(test_path, "slice_{:g}.vtk".format(i)))
-  coords_2 = jnp.array(test_mesh_2.points)
-  test_data_2.append(
-      jnp.column_stack([coords_2] + [
-          test_mesh_2.point_data.get_array(i)
-          for i in range(test_mesh_2.n_arrays)
-      ]))
-  test_adj_2.append(v2a(test_mesh_2))
-
-del test_mesh_3
-del test_mesh_2
-
-n_samples = len(ma_list)*len(re_list)*len(a_list)
+n_samples = len(ma_list)*len(re_list)*len(aoa_list)
 batch_sz = 10
 batches = -(n_samples // -batch_sz)
 test_sz = 1
+
+train_dataloader = DataLoader(train_dataset, batch_sz, shuffle=True)
+test_dataloader = DataLoader(test_dataset, test_sz, shuffle=True)
 
 rng = jrn.PRNGKey(1)
 
