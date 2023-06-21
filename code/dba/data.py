@@ -2,7 +2,7 @@ import os
 import numpy as np
 from torch.utils import data
 import pyvista as pv
-from vtk2adj import v2a
+from vtk2adj import v2a, combineAdjacency
 import jax.numpy as jnp
 
 
@@ -65,13 +65,22 @@ class GraphDataset(data.Dataset):
     mesh = pv.read(os.path.join(data_path, "flow.vtu"))
     # extract point data from coordinates and conservative fields
     coords = jnp.array(mesh.points)
-    train_data = jnp.column_stack([coords] + [
+    train_data_3 = jnp.column_stack([coords] + [
         mesh.point_data.get_array(i)
         for i in ["Density", "Momentum", "Energy"]
     ])
     # [mesh.point_data.get_array(i) for i in range(mesh.n_arrays)]))
     train_adj_3 = v2a(mesh)
 
+    slice_data = []
+    slice_adj = []
     for s in range(self.n_slices):
       mesh = pv.read(os.path.join(data_path, "slice_{:d}.vtk".format(s)))
-      
+      slice_data.append(jnp.column_stack([coords] + [
+        mesh.point_data.get_array(i)
+        for i in ["Density", "Momentum", "Energy"]
+      ]))
+      slice_adj.append(v2a(mesh))
+    train_data_2 = jnp.concatenate(slice_data, axis=0)
+    train_adj_2 = combineAdjacency(slice_adj)
+    return train_data_3, train_adj_3, train_data_2, train_adj_2
