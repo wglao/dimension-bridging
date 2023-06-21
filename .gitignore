@@ -7,3 +7,4 @@ db-env
 data
 *.tar*
 *.sif
+__pycache__
