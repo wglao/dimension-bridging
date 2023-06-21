@@ -13,7 +13,7 @@ import pyvista as pv
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--file", "-f", default="slice_mac.vtk", type=str)
+parser.add_argument("--file", "-f", default="slice_0.vtk", type=str)
 args = parser.parse_args()
 
 
@@ -43,6 +43,6 @@ def v2a(mesh):
 
 
 if __name__ == "__main__":
-  fname = args.file
+  fname = "data/ma_0.2/re_1e+08/a_0/" + args.file
   mesh = pv.read(fname)
   a = v2a(mesh)
