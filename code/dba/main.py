@@ -52,7 +52,11 @@ for ma in ma_list:
       train_data_3.append(
           jnp.column_stack(
               [coords_3] +
-              [mesh_3.point_data.get_array(i) for i in range(mesh_3.n_arrays)]))
+              # [mesh_3.point_data.get_array(i) for i in range(mesh_3.n_arrays)]))
+              [
+                  mesh_3.point_data.get_array(i)
+                  for i in ["Density", "Momentum", "Energy"]
+              ]))
       train_adj_3.append(v2a(mesh_3))
 
       slice_data = []
@@ -61,12 +65,10 @@ for ma in ma_list:
         mesh_2 = pv.read(os.path.join(path, "slice_{:g}.vtk".format(i)))
         coords_2 = jnp.array(mesh_2.points)
         slice_data.append(
-            jnp.column_stack([
-                coords_2,
-                [
-                    mesh_2.point_data.get_array(i)
-                    for i in range(mesh_2.n_arrays)
-                ]
+            jnp.column_stack([coords_2] + [
+                # mesh_2.point_data.get_array(i) for i in range(mesh_2.n_arrays)
+                mesh_2.point_data.get_array(i)
+                for i in ["Density", "Momentum", "Energy"]
             ]))
         slice_adj.append(v2a(mesh_2))
       train_data_2.append(slice_data)
@@ -80,9 +82,12 @@ del mesh_2
 
 test_path = "../../data/ma_{:g}/re_{:g}/a_{:g}".format(0.8395, 1.172e7, 3.06)
 test_mesh_3 = pv.read(os.path.join(test_path, "flow.vtu"))
-test_data_3 = jnp.column_stack([[
-    test_mesh_3.point_data.get_array(i) for i in range(test_mesh_3.n_arrays)
-]])
+coords_3 = jnp.array(mesh_3.points)
+test_data_3 = jnp.column_stack([coords_3] + [
+    # test_mesh_3.point_data.get_array(i) for i in range(test_mesh_3.n_arrays)
+    test_mesh_3.point_data.get_array(i)
+    for i in ["Density", "Momentum", "Energy"]
+])
 # test_adj_3 = v2a(test_mesh_3)
 
 test_data_2 = []
@@ -91,12 +96,9 @@ for i in range(n_slices):
   test_mesh_2 = pv.read(os.path.join(test_path, "slice_{:g}.vtk".format(i)))
   coords_2 = jnp.array(test_mesh_2.points)
   test_data_2.append(
-      jnp.column_stack([
-          coords_2,
-          [
-              test_mesh_2.point_data.get_array(i)
-              for i in range(test_mesh_2.n_arrays)
-          ]
+      jnp.column_stack([coords_2] + [
+          test_mesh_2.point_data.get_array(i)
+          for i in range(test_mesh_2.n_arrays)
       ]))
   test_adj_2.append(v2a(test_mesh_2))
 
@@ -110,10 +112,11 @@ test_sz = 1
 
 rng = jrn.PRNGKey(1)
 
-n_pools = 1
-ge_3 = GraphEncoder(n_pools, dim=3)
-ge_2 = GraphEncoder(n_pools, dim=2)
-gd = GraphDecoder(n_pools, dim=3)
+n_pools = args.pooling_layers
+ge_3 = GraphEncoder(n_pools, args.latent_sz, args.channels, dim=3)
+ge_2 = GraphEncoder(n_pools, args.latent_sz, args.channels, dim=2)
+final_sz = len(train_data_3[0, 0]) - 3
+gd = GraphDecoder(n_pools, final_sz, args.channels, dim=3)
 
 pe_3 = ge_3.init(rng, train_data_3[0], train_adj_3[0])['params']
 pe_2 = ge_2.init(rng, train_data_2[0], train_adj_2[0])['params']
