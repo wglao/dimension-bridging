@@ -44,17 +44,15 @@ train_adj_2 = []
 for ma in ma_list:
   for re in re_list:
     for a in a_list:
-      path = "../../data/ma_{:g}/re_{:g}/a_{:g}".format(
-          ma, re, a)
+      path = "../../data/ma_{:g}/re_{:g}/a_{:g}".format(ma, re, a)
       mesh_3 = pv.read(os.path.join(path, "flow.vtu"))
 
       # extract point data from coordinates and conservative fields
       coords_3 = jnp.array(mesh_3.points)
       train_data_3.append(
-          jnp.column_stack([
-              coords_3,
-              [mesh_3.point_data.get_array(i) for i in range(mesh_3.n_arrays)]
-          ]))
+          jnp.column_stack(
+              [coords_3] +
+              [mesh_3.point_data.get_array(i) for i in range(mesh_3.n_arrays)]))
       train_adj_3.append(v2a(mesh_3))
 
       slice_data = []
@@ -80,8 +78,7 @@ del mesh_2
 # train_data_3 = jnp.array(train_data_3)    #[Batches, Nodes, Fields]
 # train_data_2 = jnp.array(train_data_2)    #[Batches, Slices, Nodes, Fields]
 
-test_path = "../../data/ma_{:g}/re_{:g}/a_{:g}".format(
-    0.8395, 1.172e7, 3.06)
+test_path = "../../data/ma_{:g}/re_{:g}/a_{:g}".format(0.8395, 1.172e7, 3.06)
 test_mesh_3 = pv.read(os.path.join(test_path, "flow.vtu"))
 test_data_3 = jnp.column_stack([[
     test_mesh_3.point_data.get_array(i) for i in range(test_mesh_3.n_arrays)
