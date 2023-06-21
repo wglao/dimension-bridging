@@ -72,6 +72,25 @@ n_epochs = 100000
 
 eps = 1e-15
 
+# @jit
+# def get_acs(params, features_3, adjacency_3):
+#   a_list = []
+#   c_list = []
+#   s_list = []
+#   for fb3 in jnp.concatenate(features_3):
+#     _, a, c, s = ge_3.apply({'params': params[0]}, fb3, adjacency_3)
+#     if a_list == []:
+#       a_list = jtr.tree_map(lambda a: a / batches / batch_sz, a)
+#       c_list = jtr.tree_map(lambda c: c / batches / batch_sz, c)
+#       s_list = jtr.tree_map(lambda s: s / batches / batch_sz, s)
+#     else:
+#       a_list = jtr.tree_map(lambda a, a_new: a + a_new/batches/batch_sz,
+#                             a_list, a)
+#       c_list = jtr.tree_map(lambda c, c_new: c + c_new/batches/batch_sz,
+#                             c_list, c)
+#       s_list = jtr.tree_map(lambda s, s_new: s + s_new/batches/batch_sz,
+#                             s_list, s)
+#   return a, c, s
 
 # @jit
 def train_step(params,
@@ -102,25 +121,6 @@ def train_step(params,
                      (loss_e+loss_lp)) / batch_sz
     return loss
   
-  # @jit
-  # def get_acs(params, features_3, adjacency_3):
-  #   a_list = []
-  #   c_list = []
-  #   s_list = []
-  #   for fb3 in jnp.concatenate(features_3):
-  #     _, a, c, s = ge_3.apply({'params': params[0]}, fb3, adjacency_3)
-  #     if a_list == []:
-  #       a_list = jtr.tree_map(lambda a: a / batches / batch_sz, a)
-  #       c_list = jtr.tree_map(lambda c: c / batches / batch_sz, c)
-  #       s_list = jtr.tree_map(lambda s: s / batches / batch_sz, s)
-  #     else:
-  #       a_list = jtr.tree_map(lambda a, a_new: a + a_new/batches/batch_sz,
-  #                             a_list, a)
-  #       c_list = jtr.tree_map(lambda c, c_new: c + c_new/batches/batch_sz,
-  #                             c_list, c)
-  #       s_list = jtr.tree_map(lambda s, s_new: s + s_new/batches/batch_sz,
-  #                             s_list, s)
-  #   return a, c, s
 
   loss = 0
   a_list = []
