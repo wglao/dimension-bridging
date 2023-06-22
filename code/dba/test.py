@@ -8,6 +8,7 @@ import jax.random as jrn
 import jax.tree_util as jtr
 import optax
 from jax import grad, jit, value_and_grad, vmap
+import jax.experimental.sparse as jxs
 
 from models import (DiffPoolLayer, GraphDecoder, GraphEncoder, MoNetLayer,
                     TransAggLayer)
@@ -18,6 +19,7 @@ test_sz = 10
 nodes = 16
 adjacency = jnp.eye(nodes) + jnp.diag(jnp.ones(
     (nodes - 1,)), 1) + jnp.diag(jnp.ones((nodes - 1,)), -1)
+adjacency = jxs.bcoo_fromdense(adjacency)
 
 rng = jtr.tree_map(lambda seed: jrn.PRNGKey(seed),
                    list(jnp.arange(batches*batch_sz + test_sz)))
@@ -74,7 +76,7 @@ n_epochs = 100000
 eps = 1e-15
 
 
-@jit
+# @jit
 def train_step(params,
                features_3,
                features_2,
@@ -92,20 +94,19 @@ def train_step(params,
       loss_ae = jnp.mean(jnp.square(f[:, 3:] - fb3[:, 3:]))
       loss_2 = jnp.mean(jnp.square(fl2 - fl3))
       loss_lp = jnp.mean(
-          jnp.array(
-              jtr.tree_map(
-                  lambda a, s: jnp.sqrt(jnp.sum(jnp.square(a - s @ s.T))),
-                  a[:-1], s)))
+          jnp.array([
+              jnp.sqrt(
+                  jnp.sum(
+                      jnp.square(
+                          jxs.bcoo_sum_duplicates(
+                              a_i - jxs.bcoo_fromdense(s_i @ s_i.T)).data)))
+              for a_i, s_i in zip(a[:-1], s)
+          ]))
       loss_e = jnp.mean(
           jnp.array(
               jtr.tree_map(
-                  lambda s: jnp.mean(jnp.sum(-s*jnp.exp(s + eps), axis=-1)),
+                  lambda s: jnp.mean(jnp.sum(-s*jnp.log(s + eps), axis=-1)),
                   s)))
-      # loss_lp = 0
-      # loss_e = 0
-      # for l in range(0, n_pools):
-      #   loss_lp = loss_lp + jnp.sqrt(jnp.sum(jnp.square(a[l]-s[l]@s[l].T)))
-      #   loss_e = loss_e + jnp.mean(jnp.sum(-s[l]*jnp.log(s[l] + eps), axis=-1))
       loss = loss + (loss_ae + lam_2*loss_2 + lam_dp*
                      (loss_e+loss_lp)) / batch_sz
     return loss
@@ -158,7 +159,7 @@ def train_step(params,
   return loss, params, opt, a, c, s
 
 
-@jit
+# @jit
 def test_step(params, features_3, features_2, adjacency, coordinates,
               selection):
 
@@ -173,7 +174,6 @@ def test_step(params, features_3, features_2, adjacency, coordinates,
       loss = loss + loss_ae/test_sz
     return loss
 
-  #TODO: fix testing fn
   test_err = loss_fn(params, features_3, features_2, adjacency, coordinates,
                      selection)
   return test_err
