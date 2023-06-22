@@ -76,6 +76,7 @@ class GraphDataset(data.Dataset):
     slice_adj = []
     for s in range(self.n_slices):
       mesh = pv.read(os.path.join(data_path, "slice_{:d}.vtk".format(s)))
+      coords = np.array(mesh.points)
       slice_data.append(np.column_stack([coords] + [
         mesh.point_data.get_array(i)
         for i in ["Density", "Momentum", "Energy"]
