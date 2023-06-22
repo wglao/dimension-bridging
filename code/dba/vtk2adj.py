@@ -41,7 +41,7 @@ def v2a(mesh):
   return adjacency
 
 
-def combineAdjacency(*adjs):
+def combineAdjacency(adjs):
   in_szs = jnp.array([a.shape[0] for a in adjs])
   out_sz = jnp.sum(in_szs)
 
@@ -60,4 +60,4 @@ if __name__ == "__main__":
     fname = "data/ma_0.2/re_1e+08/a_0/slice_{:d}.vtk".format(s)
     mesh = pv.read(fname)
     adj_list.append(v2a(mesh))
-  a = combineAdjacency(*adj_list)
+  a = combineAdjacency(adj_list)
