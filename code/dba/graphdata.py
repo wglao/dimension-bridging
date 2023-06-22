@@ -4,18 +4,22 @@ from torch.utils import data
 import pyvista as pv
 from vtk2adj import v2a, combineAdjacency
 import jax.numpy as jnp
+import jax.experimental.sparse as jxs
 
 
-def numpy_collate(batch):
-  if isinstance(batch[0], np.ndarray):
-    return np.stack(batch)
+def jaxBcooCollate(batch):
+  import pdb; pdb.set_trace()
+  if isinstance(batch[0], jnp.ndarray):
+    return jnp.stack(batch)
+  if isinstance(batch[0], jxs.BCOO):
+    return batch
   if isinstance(batch[0], (tuple, list)):
     transposed = zip(*batch)
-    return [numpy_collate(samples) for samples in transposed]
-  return np.array(batch)
+    return [jaxBcooCollate(samples) for samples in transposed]
+  return batch
 
 
-class NumpyLoader(data.DataLoader):
+class BCOOLoader(data.DataLoader):
 
   def __init__(self,
                dataset,
@@ -35,7 +39,7 @@ class NumpyLoader(data.DataLoader):
         sampler=sampler,
         batch_sampler=batch_sampler,
         num_workers=num_workers,
-        collate_fn=numpy_collate,
+        collate_fn=jaxBcooCollate,
         pin_memory=pin_memory,
         drop_last=drop_last,
         timeout=timeout,

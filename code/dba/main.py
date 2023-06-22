@@ -17,7 +17,7 @@ import pyvista as pv
 from torch.utils.data import DataLoader
 
 from models import GraphDecoder, GraphEncoder
-from graphdata import GraphDataset
+from graphdata import GraphDataset, BCOOLoader
 from vtk2adj import v2a, combineAdjacency
 
 parser = argparse.ArgumentParser()
@@ -47,8 +47,8 @@ batch_sz = 1
 batches = -(n_samples // -batch_sz)
 test_sz = 1
 
-train_dataloader = DataLoader(train_dataset, batch_sz, shuffle=True)
-test_dataloader = DataLoader(test_dataset, test_sz, shuffle=True)
+train_dataloader = BCOOLoader(train_dataset, batch_sz, shuffle=True)
+test_dataloader = BCOOLoader(test_dataset, test_sz, shuffle=True)
 
 rng = jrn.PRNGKey(1)
 n_pools = args.pooling_layers
