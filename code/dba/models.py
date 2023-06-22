@@ -4,6 +4,7 @@ import flax.linen as nn
 import jax.image as jim
 import jax.numpy as jnp
 from jax import jit, vmap
+import jax.experimental.sparse as jxs
 
 
 class MitsuMatsuCNN(nn.Module):
@@ -54,16 +55,11 @@ class MoNetLayer(nn.Module):
     return jnp.abs(nn.initializers.lecun_normal()(rng, shape))
 
   @nn.compact
-  def __call__(self, features, adjacency):
+  def __call__(self, features, adjacency: jxs.BCOO):
     n_nodes = adjacency.shape[-1]
     # take first `dim` elements to be the node coordinates
     node_coords = features[:, :self.dim]
-    monet_xi = jnp.reshape(jnp.tile(node_coords, (
-        1,
-        n_nodes,
-    )), (n_nodes, n_nodes, self.dim))
-    monet_xj = jnp.expand_dims(jnp.where(adjacency > 0, 1, 0), -1)*node_coords
-    monet_u = (monet_xj.T - monet_xi.T).T
+    monet_u = vmap(lambda i: node_coords[i[1]]-node_coords[i[0]])(adjacency.indices)
     monet_u = jnp.expand_dims(self.act(nn.Dense(self.r)(monet_u)), axis=-1)
 
     mu = self.param('mu', nn.initializers.lecun_normal(),
