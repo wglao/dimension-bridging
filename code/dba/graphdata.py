@@ -7,9 +7,21 @@ import jax.numpy as jnp
 import jax.experimental.sparse as jxs
 
 
+# def _jaxTyoeCheck(item):
+#   import pdb; pdb.set_trace()
+#   if isinstance(batch[0], jnp.ndarray):
+#     return jnp.stack(batch)
+#   if isinstance(batch[0], jxs.BCOO):
+#     return batch
+#   if isinstance(batch[0], (tuple, list)):
+#     transposed = zip(*batch)
+#     return [jaxBcooCollate(samples) for samples in transposed]
+#   return batch
+
 def jaxBcooCollate(batch):
-  import pdb; pdb.set_trace()
   if isinstance(batch[0], jnp.ndarray):
+    return jnp.stack(batch)
+  if isinstance(batch[0], np.ndarray):
     return jnp.stack(batch)
   if isinstance(batch[0], jxs.BCOO):
     return batch

@@ -45,11 +45,12 @@ def combineAdjacency(adjs):
   in_szs = jnp.array([a.shape[0] for a in adjs])
   out_sz = jnp.sum(in_szs)
 
-  buffer = jnp.concatenate((jnp.array([0]),jnp.cumsum(in_szs)[:-1]), axis=None)
+  buffer = jnp.concatenate((jnp.array([0]), jnp.cumsum(in_szs)[:-1]), axis=None)
   indices = jnp.concatenate(
       [a.indices + jnp.array([b, b]) for a, b in zip(adjs, buffer)], axis=0)
   data = jnp.concatenate([a.data for a in adjs], axis=None)
-  adjacency = jxs.BCOO((data,indices), shape=(out_sz,out_sz))
+  adjacency = jxs.BCOO((data, indices),
+                       shape=(int(out_sz), int(out_sz)))
 
   return adjacency
 

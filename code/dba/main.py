@@ -16,13 +16,13 @@ import jax.experimental.sparse as jxs
 import pyvista as pv
 from torch.utils.data import DataLoader
 
-from models import GraphDecoder, GraphEncoder
+from models import GraphEncoder, GraphDecoder, GraphEncoderNoPooling, GraphDecoderNoPooling
 from graphdata import GraphDataset, BCOOLoader
 from vtk2adj import v2a, combineAdjacency
 
 parser = argparse.ArgumentParser()
 
-parser.add_argument("--channels", "-c", default=100, type=int)
+parser.add_argument("--channels", "-c", default=1, type=int)
 parser.add_argument("--latent-sz", "-s", default=50, type=int)
 parser.add_argument("--pooling-layers", "-p", default=1, type=int)
 parser.add_argument("--lambda-2d", "-l2d", default=1, type=float)
@@ -53,13 +53,16 @@ test_dataloader = BCOOLoader(test_dataset, test_sz, shuffle=True)
 rng = jrn.PRNGKey(1)
 n_pools = args.pooling_layers
 
-# init_data_3, init_adj_3, init_data_2, init_adj_2 = [i[0] for i in next(iter(train_dataloader))]    # -> batch > 1
-init_data_3, init_adj_3, init_data_2, init_adj_2 = next(iter(test_dataloader))
+# init_data_3, init_adj_3, init_data_2, init_adj_2 = [i[0] for i in next(iter(train_dataloader))]
+init_data_3, init_adj_3, init_data_2, init_adj_2 = [i[0] for i in next(iter(test_dataloader))]
 
-ge_3 = GraphEncoder(n_pools, args.latent_sz, args.channels, dim=3)
-ge_2 = GraphEncoder(n_pools, args.latent_sz, args.channels, dim=2)
-final_sz = len(init_data_3) - 3
-gd = GraphDecoder(n_pools, final_sz, args.channels, dim=3)
+# ge_3 = GraphEncoder(n_pools, args.latent_sz, args.channels, dim=3)
+# ge_2 = GraphEncoder(n_pools, args.latent_sz, args.channels, dim=2)
+ge_3 = GraphEncoderNoPooling(n_pools, args.latent_sz, args.channels, dim=3)
+ge_2 = GraphEncoderNoPooling(n_pools, args.latent_sz, args.channels, dim=2)
+final_sz = init_data_3.shape[-1] - 3
+# gd = GraphDecoder(n_pools, final_sz, args.channels, dim=3)
+gd = GraphDecoderNoPooling(n_pools, final_sz, args.channels, dim=3)
 
 pe_3 = ge_3.init(rng, init_data_3, init_adj_3)['params']
 pe_2 = ge_2.init(rng, init_data_2, init_adj_2)['params']
