@@ -100,7 +100,7 @@ class GraphDataset(data.Dataset):
       slice_adj.append(v2a(mesh))
     train_data_2 = np.concatenate(slice_data, axis=0)
     train_adj_2 = combineAdjacency(slice_adj)
-    return train_data_3, train_adj_3, train_data_2, train_adj_2
+    return train_data_3, train_data_2, train_adj_3, train_adj_2
   
 if __name__ == "__main__":
   ma_list = [0.2, 0.35, 0.5, 0.65, 0.8]

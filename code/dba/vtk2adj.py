@@ -16,10 +16,10 @@ parser.add_argument("--file", "-f", default="slice_0.vtk", type=str)
 args = parser.parse_args()
 
 
-def connect(carry, edge):
+def connect(edge):
   indices = jnp.meshgrid(edge, edge)
   indices = jnp.column_stack((indices[0].ravel(), indices[1].ravel()))
-  return None, indices
+  return indices
 
 
 def v2a(mesh):
@@ -29,13 +29,13 @@ def v2a(mesh):
   edges = jnp.reshape(edges, (n_edges, 3))[:, 1:]
 
   adjacency = jxs.eye(n_nodes)
-  _, indices = scan(connect, None, edges)
+  indices = vmap(connect)(edges)
   indices = jnp.concatenate(indices, axis=0)
   adjacency.indices = jnp.concatenate((adjacency.indices, indices), axis=0)
 
   z_pad = jnp.ones((len(adjacency.indices) - len(adjacency.data),))
   adjacency.data = jnp.concatenate((adjacency.data, z_pad), axis=None)
-  adjacency = adjacency.sum_duplicates()
+  adjacency = adjacency.sum_duplicates(nse=2*n_edges)
   adjacency.data = jnp.ones_like(adjacency.data)
 
   return adjacency
@@ -43,8 +43,7 @@ def v2a(mesh):
 
 def combineAdjacency(adjs):
   in_szs = jnp.array([a.shape[0] for a in adjs])
-  out_sz = jnp.sum(in_szs)
-
+  out_sz = int(jnp.sum(in_szs))
   buffer = jnp.concatenate((jnp.array([0]), jnp.cumsum(in_szs)[:-1]), axis=None)
   indices = jnp.concatenate(
       [a.indices + jnp.array([b, b]) for a, b in zip(adjs, buffer)], axis=0)
