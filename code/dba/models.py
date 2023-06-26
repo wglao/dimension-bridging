@@ -58,6 +58,10 @@ class MoNetLayer(nn.Module):
     out = attention @ features
     return out
 
+  def get_xi(self, xi, x):
+    coords, i, j = x
+    return xi.at[i:j].set(coords), None
+
   @nn.compact
   def __call__(self, features, adjacency: jxs.BCSR):
     n_nodes = adjacency.shape[-1]
@@ -65,8 +69,8 @@ class MoNetLayer(nn.Module):
     node_coords = features[:, :self.dim]
     # assume node coords are 3d
     monet_xi = jnp.concatenate(
-        scan(lambda c, x: (c, x[0]*jnp.ones((x[1] - x[2], 3))))(
-            None, (node_coords, adjacency.indptr[1:], adjacency.indptr[:-1]))[1],
+        scan(self.get_xi, jnp.zeros((adjacency.nse,3)), [(c, i, j) for c, i, j in zip(
+            node_coords, adjacency.indptr[1:], adjacency.indptr[:-1])])[1],
         axis=0)
     monet_xj = node_coords[adjacency.indices]
     monet_u = monet_xj - monet_xi
