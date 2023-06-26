@@ -28,29 +28,33 @@ def v2a(mesh):
   n_edges = len(edges) // 3
   edges = jnp.reshape(edges, (n_edges, 3))[:, 1:]
 
-  adjacency = jxs.eye(n_nodes)
   indices = vmap(connect)(edges)
   indices = jnp.concatenate(indices, axis=0)
-  adjacency.indices = jnp.concatenate((adjacency.indices, indices), axis=0)
+  main_diag = jnp.column_stack((jnp.arange(n_nodes), jnp.arange(n_nodes)))
+  indices = jnp.concatenate((indices, main_diag), axis=0)
 
-  z_pad = jnp.ones((len(adjacency.indices) - len(adjacency.data),))
-  adjacency.data = jnp.concatenate((adjacency.data, z_pad), axis=None)
-  adjacency = adjacency.sum_duplicates(nse=2*n_edges)
-  adjacency.data = jnp.ones_like(adjacency.data)
+  data = jnp.ones((indices.shape[0],))
 
+  adjacency = jxs.BCSR.from_bcoo(
+      jxs.BCOO((data, indices), shape=(n_nodes, n_nodes)))
   return adjacency
 
 
 def combineAdjacency(adjs):
   in_szs = jnp.array([a.shape[0] for a in adjs])
+  in_nse = jnp.array([a.nse for a in adjs])
   out_sz = int(jnp.sum(in_szs))
   buffer = jnp.concatenate((jnp.array([0]), jnp.cumsum(in_szs)[:-1]), axis=None)
-  indices = jnp.concatenate(
-      [a.indices + jnp.array([b, b]) for a, b in zip(adjs, buffer)], axis=0)
+  buff_ptr = jnp.concatenate((jnp.array([0]), jnp.cumsum(in_nse)[:-1]+1),
+                             axis=None)
+  indices = jnp.concatenate([a.indices + b for a, b in zip(adjs, buffer)],
+                            axis=0)
+  indptr = jnp.concatenate([a.indptr[:-1] + b for a, b in zip(adjs, buff_ptr)],
+                           axis=0)
+  indptr = jnp.concatenate((indptr, jnp.array([jnp.sum(in_nse)])), axis=None)
   data = jnp.concatenate([a.data for a in adjs], axis=None)
-  adjacency = jxs.BCOO((data, indices),
+  adjacency = jxs.BCSR((data, indices, indptr),
                        shape=(int(out_sz), int(out_sz)))
-
   return adjacency
 
 

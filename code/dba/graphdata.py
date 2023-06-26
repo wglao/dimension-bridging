@@ -6,7 +6,6 @@ from vtk2adj import v2a, combineAdjacency
 import jax.numpy as jnp
 import jax.experimental.sparse as jxs
 
-
 # def _jaxTyoeCheck(item):
 #   import pdb; pdb.set_trace()
 #   if isinstance(batch[0], jnp.ndarray):
@@ -15,23 +14,26 @@ import jax.experimental.sparse as jxs
 #     return batch
 #   if isinstance(batch[0], (tuple, list)):
 #     transposed = zip(*batch)
-#     return [jaxBcooCollate(samples) for samples in transposed]
+#     return [jxsSpCollate(samples) for samples in transposed]
 #   return batch
 
-def jaxBcooCollate(batch):
+
+def jxsSpCollate(batch):
   if isinstance(batch[0], jnp.ndarray):
     return jnp.stack(batch)
   if isinstance(batch[0], np.ndarray):
     return jnp.stack(batch)
   if isinstance(batch[0], jxs.BCOO):
     return batch
+  if isinstance(batch[0], jxs.BCSR):
+    return batch
   if isinstance(batch[0], (tuple, list)):
     transposed = zip(*batch)
-    return [jaxBcooCollate(samples) for samples in transposed]
+    return [jxsSpCollate(samples) for samples in transposed]
   return batch
 
 
-class BCOOLoader(data.DataLoader):
+class SpLoader(data.DataLoader):
 
   def __init__(self,
                dataset,
@@ -51,7 +53,7 @@ class BCOOLoader(data.DataLoader):
         sampler=sampler,
         batch_sampler=batch_sampler,
         num_workers=num_workers,
-        collate_fn=jaxBcooCollate,
+        collate_fn=jxsSpCollate,
         pin_memory=pin_memory,
         drop_last=drop_last,
         timeout=timeout,
@@ -60,7 +62,7 @@ class BCOOLoader(data.DataLoader):
 
 class GraphDataset(data.Dataset):
 
-  def __init__(self, data_dir, ma_list, re_list, aoa_list, n_slices:int = 5):
+  def __init__(self, data_dir, ma_list, re_list, aoa_list, n_slices: int = 5):
     self.data_dir = data_dir
     self.ma_list = ma_list
     self.re_list = re_list
@@ -83,7 +85,8 @@ class GraphDataset(data.Dataset):
     coords = np.array(mesh.points)
     train_data_3 = np.column_stack([coords] + [
         mesh.point_data.get_array(i)
-        for i in ["Density", "Momentum", "Energy"]
+        # for i in ["Density", "Momentum", "Energy"]
+        for i in ["Density"]  # Density only for Memory
     ])
     # [mesh.point_data.get_array(i) for i in range(mesh.n_arrays)]))
     train_adj_3 = v2a(mesh)
@@ -93,15 +96,18 @@ class GraphDataset(data.Dataset):
     for s in range(self.n_slices):
       mesh = pv.read(os.path.join(data_path, "slice_{:d}.vtk".format(s)))
       coords = np.array(mesh.points)
-      slice_data.append(np.column_stack([coords] + [
-        mesh.point_data.get_array(i)
-        for i in ["Density", "Momentum", "Energy"]
-      ]))
+      slice_data.append(
+          np.column_stack([coords] + [
+              mesh.point_data.get_array(i)
+              # for i in ["Density", "Momentum", "Energy"]
+              for i in ["Density"]  # Density only for Memory
+          ]))
       slice_adj.append(v2a(mesh))
     train_data_2 = np.concatenate(slice_data, axis=0)
     train_adj_2 = combineAdjacency(slice_adj)
     return train_data_3, train_data_2, train_adj_3, train_adj_2
-  
+
+
 if __name__ == "__main__":
   ma_list = [0.2, 0.35, 0.5, 0.65, 0.8]
   re_list = [1e5, 1e6, 1e7, 1e8]

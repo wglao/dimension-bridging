@@ -17,7 +17,7 @@ import pyvista as pv
 from torch.utils.data import DataLoader
 
 from models import GraphEncoder, GraphDecoder, GraphEncoderNoPooling, GraphDecoderNoPooling
-from graphdata import GraphDataset, BCOOLoader
+from graphdata import GraphDataset, SpLoader
 from vtk2adj import v2a, combineAdjacency
 
 parser = argparse.ArgumentParser()
@@ -47,8 +47,8 @@ batch_sz = 1
 batches = -(n_samples // -batch_sz)
 test_sz = 1
 
-train_dataloader = BCOOLoader(train_dataset, batch_sz, shuffle=True)
-test_dataloader = BCOOLoader(test_dataset, test_sz, shuffle=True)
+train_dataloader = SpLoader(train_dataset, batch_sz, shuffle=True)
+test_dataloader = SpLoader(test_dataset, test_sz, shuffle=True)
 
 rng = jrn.PRNGKey(1)
 n_pools = args.pooling_layers
@@ -98,7 +98,7 @@ eps = 1e-15
 #   return a, c, s
 
 
-# @jit÷
+@jit
 def train_step(params, opt: optax.OptState, lam_2, lam_dp, data_3, data_2,
                adj_3, adj_2):
 
