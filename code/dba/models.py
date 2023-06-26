@@ -42,7 +42,7 @@ class MoNetLayer(nn.Module):
 
   def _get_weight_i(self, mu, sig, u_j):
     return jnp.exp(-0.5*
-                   ((u_j - mu).T @ jnp.linalg.inv(jnp.diag(sig)) @ (u_j-mu)))
+                   ((u_j-mu).T @ jnp.linalg.inv(jnp.diag(sig)) @ (u_j-mu)))
 
   get_weights = vmap(
       _get_weight_i, in_axes=(None, None, None, 0))  # map over edge
@@ -62,8 +62,14 @@ class MoNetLayer(nn.Module):
     n_nodes = adjacency.shape[-1]
     # take first `dim` elements to be the node coordinates
     node_coords = features[:, :self.dim]
-    monet_u = vmap(lambda i: node_coords[i[1]] - node_coords[i[0]])(
-        adjacency.indices)
+    # assume node coords are 3d
+    monet_xi = jnp.concatenate(
+        vmap(lambda i, j, k: i*jnp.ones((j - k,3)))(node_coords,
+                                                  adjacency.indptr[1:],
+                                                  adjacency.indptr[:-1]),
+        axis=0)
+    monet_xj = node_coords[adjacency.indices]
+    monet_u = monet_xj - monet_xi
     # learned coordinates from monet paper
     monet_u = jnp.expand_dims(self.act(nn.Dense(self.r)(monet_u)), axis=-1)
 
