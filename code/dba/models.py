@@ -58,7 +58,7 @@ class MoNetLayer(nn.Module):
     return out
 
   @nn.compact
-  def __call__(self, features, adjacency: jxs.BCOO):
+  def __call__(self, features, adjacency: jxs.BCSR):
     n_nodes = adjacency.shape[-1]
     # take first `dim` elements to be the node coordinates
     node_coords = features[:, :self.dim]
@@ -82,14 +82,14 @@ class DiffPoolLayer(nn.Module):
   act: callable = nn.softmax
 
   @nn.compact
-  def __call__(self, features, adjacency: jxs.BCOO):
+  def __call__(self, features, adjacency: jxs.BCSR):
     # take ceil of n/pf**dim
     n_clusters = int(-(adjacency.shape[-1] // -(self.pool_factor**self.dim)))
 
     gnn_s = MoNetLayer(n_clusters, self.dim)
 
     s = gnn_s(features, adjacency)
-    s = self.act(s[:, self.dim:], axis=-1)
+    s = jxs.BCSR.fromdense(self.act(s[:, self.dim:], axis=-1))
     # s = (s.T[~jnp.all(s.T == 0, axis=-1)]).T
 
     f = s.T @ features
@@ -121,6 +121,7 @@ class TransAggLayer(nn.Module):
     s_data = jnp.concatenate(selection.T, axis=None)
     a_data = jnp.concatenate((adjacency.data, s_data, jnp.ones((p_nodes,))),
                              axis=None)
+    #TODO: switch to bcsr
     a = jxs.BCOO((a_data, a_ind), shape=(c_nodes + p_nodes, c_nodes + p_nodes))
     f = jnp.row_stack((jnp.column_stack(
         (node_coords,
