@@ -51,8 +51,9 @@ class MoNetLayer(nn.Module):
     return jnp.squeeze(jnp.abs(nn.initializers.lecun_normal()(rng, shape)))
 
   def aggregate(self, weights, adjacency, features):
-    attention = jxs.BCOO((adjacency.data*weights, adjacency.indices),
-                         shape=adjacency.shape)
+    attention = jxs.BCSR(
+        (adjacency.data*weights, adjacency.indices, adjacency.indptr),
+        shape=adjacency.shape)
     out = attention @ features
     return out
 
@@ -67,7 +68,7 @@ class MoNetLayer(nn.Module):
     monet_u = jnp.expand_dims(self.act(nn.Dense(self.r)(monet_u)), axis=-1)
 
     mu = self.param('mu', nn.initializers.lecun_normal(), (self.r, 1))
-    sig = self.param('sigma', self.sig_init, (self.r,1))
+    sig = self.param('sigma', self.sig_init, (self.r, 1))
     weights = jnp.squeeze(self.get_weights(mu, sig, monet_u))
     out = self.aggregate(weights, adjacency, features[:, self.dim:])
     out = vmap(nn.Dense(self.channels))(out)
