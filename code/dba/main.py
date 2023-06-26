@@ -3,6 +3,18 @@ import sys
 from functools import partial
 import argparse
 
+parser = argparse.ArgumentParser()
+
+parser.add_argument("--channels", default=10, type=int)
+parser.add_argument("--latent-sz", default=10, type=int)
+parser.add_argument("--pooling-layers", default=1, type=int)
+parser.add_argument("--lambda-2d", default=1, type=float)
+parser.add_argument("--lambda-dp", default=1, type=float)
+parser.add_argument("--wandb", default=0, type=int)
+
+args = parser.parse_args()
+wandb_upload = bool(args.wandb)
+
 import flax.core.frozen_dict as fd
 import flax.linen as nn
 import jax.numpy as jnp
@@ -20,17 +32,6 @@ from models import GraphEncoder, GraphDecoder, GraphEncoderNoPooling, GraphDecod
 from graphdata import GraphDataset, SpLoader
 from vtk2adj import v2a, combineAdjacency
 
-parser = argparse.ArgumentParser()
-
-parser.add_argument("--channels", "-c", default=10, type=int)
-parser.add_argument("--latent-sz", "-s", default=10, type=int)
-parser.add_argument("--pooling-layers", "-p", default=1, type=int)
-parser.add_argument("--lambda-2d", "-l2d", default=1, type=float)
-parser.add_argument("--lambda-dp", "-ldp", default=1, type=float)
-parser.add_argument("--wandb", "-w", default=0, type=int)
-
-args = parser.parse_args()
-wandb_upload = bool(args.wandb)
 
 # loop through folders and load data
 ma_list = [0.2, 0.35, 0.5, 0.65, 0.8]
@@ -61,7 +62,7 @@ init_data_3, init_data_2, init_adj_3, init_adj_2 = [
 # ge_3 = GraphEncoder(n_pools, args.latent_sz, args.channels, dim=3)
 # ge_2 = GraphEncoder(n_pools, args.latent_sz, args.channels, dim=2)
 ge_3 = GraphEncoderNoPooling(n_pools, args.latent_sz, args.channels, dim=3)
-ge_2 = GraphEncoderNoPooling(n_pools, args.latent_sz, args.channels, dim=2)
+ge_2 = GraphEncoderNoPooling(n_pools, args.latent_sz, args.channels, dim=3)    # slices have 3d coords
 final_sz = init_data_3.shape[-1] - 3
 # gd = GraphDecoder(n_pools, final_sz, args.channels, dim=3)
 gd = GraphDecoderNoPooling(n_pools, final_sz, args.channels, dim=3)
