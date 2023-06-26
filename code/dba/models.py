@@ -4,6 +4,7 @@ import flax.linen as nn
 import jax.image as jim
 import jax.numpy as jnp
 from jax import jit, vmap
+from jax.lax import scan
 import jax.experimental.sparse as jxs
 
 
@@ -42,7 +43,7 @@ class MoNetLayer(nn.Module):
 
   def _get_weight_i(self, mu, sig, u_j):
     return jnp.exp(-0.5*
-                   ((u_j-mu).T @ jnp.linalg.inv(jnp.diag(sig)) @ (u_j-mu)))
+                   ((u_j - mu).T @ jnp.linalg.inv(jnp.diag(sig)) @ (u_j-mu)))
 
   get_weights = vmap(
       _get_weight_i, in_axes=(None, None, None, 0))  # map over edge
@@ -64,9 +65,8 @@ class MoNetLayer(nn.Module):
     node_coords = features[:, :self.dim]
     # assume node coords are 3d
     monet_xi = jnp.concatenate(
-        vmap(lambda i, j, k: i*jnp.ones((j - k,3)))(node_coords,
-                                                  adjacency.indptr[1:],
-                                                  adjacency.indptr[:-1]),
+        scan(lambda c, x: (c, x[0]*jnp.ones((x[1] - x[2], 3))))(
+            None, (node_coords, adjacency.indptr[1:], adjacency.indptr[:-1]))[1],
         axis=0)
     monet_xj = node_coords[adjacency.indices]
     monet_u = monet_xj - monet_xi
@@ -118,13 +118,20 @@ class TransAggLayer(nn.Module):
     #TODO: switch a to bcsr
     p_nodes = selection.shape[-1]
     c_nodes = adjacency.shape[-1]
-    s_ind = jnp.row_stack(
-        vmap(lambda i: jnp.column_stack((jnp.reshape(
-            jnp.arange(c_nodes), (c_nodes, 1)), (c_nodes+i)*jnp.ones((
-                c_nodes, 1)))))(jnp.arange(1, p_nodes + 1)))
-    x_ind = vmap(lambda i: (c_nodes+i)*jnp.ones((2,)))(
-        jnp.arange(1, p_nodes + 1))
-    a_ind = jnp.row_stack((adjacency.indices, s_ind, x_ind), dtype=int)
+    x_ind = vmap(lambda i: c_nodes + i)(jnp.arange(1, p_nodes + 1))
+    a_ind = jnp.concatenate((vmap(lambda i, j, k, l: jnp.concatenate(
+        (adjacency.indices[i:j], selection.indices[k:l] + c_nodes), axis=None))(
+            adjacency.indptr[:-1], adjacency.indptr[1:], selection.indptr[:-1],
+            selection.indptr[1:]), x_ind),
+                            axis=None)
+
+    s_ptr = jnp.concatenate((jnp.zeros(
+        (1,)), selection.indptr[1:-1] - selection.indptr[:-2]),
+                            axis=None)
+    x_ptr = jnp.arange(adjacency.nse + selection.nse,
+                       adjacency.nse + selection.nse + p_nodes + 1)
+    a_ptr = jnp.concatenate(((adjacency.indptr + s_ptr), x_ptr), axis=None)
+
     s_data = jnp.concatenate(selection.T, axis=None)
     a_data = jnp.concatenate((adjacency.data, s_data, jnp.ones((p_nodes,))),
                              axis=None)
