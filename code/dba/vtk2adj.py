@@ -9,12 +9,6 @@ import pandas as pd
 import jax.experimental.sparse as jxs
 import pyvista as pv
 
-import argparse
-
-parser = argparse.ArgumentParser()
-parser.add_argument("--file", "-f", default="slice_0.vtk", type=str)
-args = parser.parse_args()
-
 
 def connect(edge):
   indices = jnp.meshgrid(edge, edge)
@@ -59,6 +53,12 @@ def combineAdjacency(adjs):
 
 
 if __name__ == "__main__":
+  import argparse
+
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--file", "-f", default="slice_0.vtk", type=str)
+  args = parser.parse_args()
+  
   adj_list = []
   for s in range(5):
     fname = "data/ma_0.2/re_1e+08/a_0/slice_{:d}.vtk".format(s)
