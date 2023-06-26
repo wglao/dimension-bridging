@@ -109,6 +109,7 @@ class TransAggLayer(nn.Module):
     # build new graph combining parent and children nodes
     # by appending selection (clustering) adjacency
     # to true graph adjacency
+    #TODO: switch a to bcsr
     p_nodes = selection.shape[-1]
     c_nodes = adjacency.shape[-1]
     s_ind = jnp.row_stack(
@@ -121,7 +122,6 @@ class TransAggLayer(nn.Module):
     s_data = jnp.concatenate(selection.T, axis=None)
     a_data = jnp.concatenate((adjacency.data, s_data, jnp.ones((p_nodes,))),
                              axis=None)
-    #TODO: switch to bcsr
     a = jxs.BCOO((a_data, a_ind), shape=(c_nodes + p_nodes, c_nodes + p_nodes))
     f = jnp.row_stack((jnp.column_stack(
         (node_coords,
