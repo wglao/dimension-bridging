@@ -5,6 +5,7 @@ import jax.image as jim
 import jax.numpy as jnp
 from jax import jit, vmap
 from jax.lax import scan
+from jax.lax import dynamic_update_slice as duds
 import jax.experimental.sparse as jxs
 
 
@@ -45,8 +46,8 @@ class MoNetLayer(nn.Module):
     return jnp.exp(-0.5*
                    ((u_j - mu).T @ jnp.linalg.inv(jnp.diag(sig)) @ (u_j-mu)))
 
-  get_weights = vmap(
-      _get_weight_i, in_axes=(None, None, None, 0))  # map over edge
+  get_weights = vmap(_get_weight_i,
+                     in_axes=(None, None, None, 0))  # map over edge
 
   def sig_init(self, rng, shape):
     return jnp.squeeze(jnp.abs(nn.initializers.lecun_normal()(rng, shape)))
@@ -58,20 +59,17 @@ class MoNetLayer(nn.Module):
     out = attention @ features
     return out
 
-  def get_xi(self, xi, x):
-    coords, i, j = x
-    return xi.at[i:j].set(coords), None
-
   @nn.compact
   def __call__(self, features, adjacency: jxs.BCSR):
     n_nodes = adjacency.shape[-1]
     # take first `dim` elements to be the node coordinates
     node_coords = features[:, :self.dim]
     # assume node coords are 3d
-    monet_xi = jnp.concatenate(
-        scan(self.get_xi, jnp.zeros((adjacency.nse,3)), [(c, i, j) for c, i, j in zip(
-            node_coords, adjacency.indptr[1:], adjacency.indptr[:-1])])[1],
-        axis=0)
+    xi_ind = scan(
+        lambda c, x:
+        (c, jnp.argwhere(adjacency.indptr <= x, size=adjacency.indptr.shape[0])[
+            -1]), None, jnp.arange(adjacency.nse))[1]
+    monet_xi = node_coords[xi_ind]
     monet_xj = node_coords[adjacency.indices]
     monet_u = monet_xj - monet_xi
     # learned coordinates from monet paper
@@ -176,8 +174,8 @@ class GraphEncoder(nn.Module):
 
     for l in range(self.n_pools):
       # ideally pf=2, pf>2 due to memory constraints
-      selection, f, a_coarse = DiffPoolLayer(
-          pool_factor=2, dim=self.dim)(f, a[-1])
+      selection, f, a_coarse = DiffPoolLayer(pool_factor=2, dim=self.dim)(f,
+                                                                          a[-1])
       a.append(jxs.bcoo_fromdense(a_coarse))
       c.append(f[:, :self.dim])
       s.append(selection)
