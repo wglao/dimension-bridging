@@ -65,10 +65,7 @@ class MoNetLayer(nn.Module):
     # take first `dim` elements to be the node coordinates
     node_coords = features[:, :self.dim]
     # assume node coords are 3d
-    xi_ind = scan(
-        lambda c, x:
-        (c, jnp.argwhere(adjacency.indptr <= x, size=adjacency.indptr.shape[0])[
-            -1]), None, jnp.arange(adjacency.nse))[1]
+    xi_ind = adjacency.to_bcoo().indices[:,0]
     monet_xi = node_coords[xi_ind]
     monet_xj = node_coords[adjacency.indices]
     monet_u = monet_xj - monet_xi
