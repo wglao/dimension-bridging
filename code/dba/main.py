@@ -189,13 +189,9 @@ def test_step(params, adj_list, coordinates, selection, data_3, data_2, adj_2):
     return loss
 
   test_err = 0
-  for batch in range(test_dataset.items):
-    d3 = data_3[batch]
-    d2 = data_2[batch]
-    a2 = adj_2[batch]
 
-    sample_err = loss_fn(params, d3, d2, a2, adj_list, coordinates, selection)
-    test_err += sample_err / test_dataset.items
+  sample_err = loss_fn(params, data_3, data_2, adj_2, adj_list, coordinates, selection)
+  test_err += sample_err / test_dataset.items
   return test_err
 
 
