@@ -8,3 +8,4 @@ data
 *.tar*
 *.sif
 __pycache__
+wandb
