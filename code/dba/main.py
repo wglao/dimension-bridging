@@ -5,18 +5,26 @@ import argparse
 
 parser = argparse.ArgumentParser()
 
-parser.add_argument("--case-name", default="dba", type=str)
-parser.add_argument("--channels", default=10, type=int)
-parser.add_argument("--latent-sz", default=10, type=int)
-parser.add_argument("--pooling-layers", default=1, type=int)
-parser.add_argument("--lambda-2d", default=1, type=float)
-parser.add_argument("--lambda-dp", default=1, type=float)
-parser.add_argument("--wandb", default=0, type=int)
+parser.add_argument(
+    "--case-name", default="dba", type=str, help="Architecture Name")
+parser.add_argument(
+    "--channels", default=10, type=int, help="Aggregation Channels")
+parser.add_argument(
+    "--latent-sz", default=10, type=int, help="Latent Space Dimensionality")
+parser.add_argument(
+    "--pooling-layers", default=1, type=int, help="Number of Pooling Layers")
+parser.add_argument("--lambda-2d", default=1, type=float, help="2D Loss Weight")
+parser.add_argument(
+    "--lambda-dp", default=1, type=float, help="DiffPool Loss Weight")
+parser.add_argument("--wandb", default=0, type=int, help="wandb upload")
+parser.add_argument('--gpu-id', type=int, help="GPU index")
 
 args = parser.parse_args()
 wandb_upload = bool(args.wandb)
-case_name = "_".join(
-    [str(key) + "-" + str(value) for key, value in vars(args).items()])[10:]
+case_name = "_".join([
+    str(key) + "-" + str(value) for key, value in vars(args).items()[:-1]
+])[10:]
+os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_id)
 
 import flax.core.frozen_dict as fd
 import flax.linen as nn
