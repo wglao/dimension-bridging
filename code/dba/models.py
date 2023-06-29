@@ -201,7 +201,7 @@ class GraphEncoderNoPooling(GraphEncoder):
 
     f_latent = self.act(nn.Dense(self.n_hidden_variables)(f.ravel()))
     f_latent = nn.Dense(self.n_latent_variables)(f_latent)
-    return f_latent, a, c, None
+    return f_latent, a, c, [jxs.eye(1, sparse_format='csr')]
 
 
 class GraphDecoder(nn.Module):
@@ -250,11 +250,9 @@ class GraphDecoderNoPooling(GraphDecoder):
     f = self.act(nn.Dense(self.n_hidden_variables*n_nodes)(f))
     f = jnp.reshape(f, (n_nodes, len(f) // n_nodes))
     f = jnp.column_stack((c_list[-1], f))
-
     f = self.act_no_coords(
         MoNetLayer(self.n_final_variables, self.dim)(f, a_list[0]))
     return f
-
 
 class GraphAutoEncoder(nn.Module):
   n_pools: int = 1
