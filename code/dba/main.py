@@ -1,5 +1,7 @@
 import os
 import sys
+from datetime import date
+import shutil
 from functools import partial
 import argparse
 
@@ -17,10 +19,11 @@ parser.add_argument("--lambda-2d", default=1, type=float, help="2D Loss Weight")
 parser.add_argument(
     "--lambda-dp", default=1, type=float, help="DiffPool Loss Weight")
 parser.add_argument("--wandb", default=0, type=int, help="wandb upload")
-parser.add_argument('--gpu-id', type=int, help="GPU index")
+parser.add_argument('--gpu-id', default=0, type=int, help="GPU index")
 
 args = parser.parse_args()
 wandb_upload = bool(args.wandb)
+today = date.today()
 case_name = "_".join([
     str(key) + "-" + str(value) for key, value in list(vars(args).items())[:-1]
 ])[10:]
@@ -45,7 +48,8 @@ from graphdata import GraphDataset, SpLoader
 from vtk2adj import v2a, combineAdjacency
 
 # loop through folders and load data
-ma_list = [0.2, 0.35, 0.5, 0.65, 0.8]
+# ma_list = [0.2, 0.35, 0.5, 0.65, 0.8]
+ma_list = [0.35, 0.5, 0.65]
 # ma_list = [0.5]
 re_list = [1e5, 1e6, 1e7, 1e8]
 # re_list = [1e5]
@@ -55,11 +59,12 @@ n_slices = 5
 data_path = os.path.join(os.environ["SCRATCH"], "ORNL/dimension-bridging/data")
 
 train_dataset = GraphDataset(data_path, ma_list, re_list, aoa_list, n_slices)
-test_dataset = GraphDataset(data_path, [0.8395], [1.172e7], [3.06], n_slices)
+test_dataset = GraphDataset(data_path, [0.2, 0.8], re_list, aoa_list, n_slices)
 
 n_samples = len(ma_list)*len(re_list)*len(aoa_list)
 batch_sz = 1
 batches = -(n_samples // -batch_sz)
+n_test = 2*len(re_list)*len(aoa_list)
 test_sz = 1
 
 train_dataloader = SpLoader(train_dataset, batch_sz, shuffle=True)
@@ -89,7 +94,10 @@ pd = gd.init(rng, f_latent, a, c, s)['params']
 params = [pe_3, pe_2, pd]
 
 check = orb.PyTreeCheckpointer()
-check.save(os.path.join(data_path, "models", case_name + "_init"), params)
+check_path = os.path.join(data_path, "models", case_name + "_init", today.strftime("%d%m%y"))
+if os.path.exists(check_path):
+  shutil.rmtree(check_path)
+check.save(check_path, params)
 
 tx = optax.adam(1e-3)
 
@@ -238,6 +246,8 @@ def main(params, n_epochs):
     a_list = []
     c_list = []
     s_list = []
+    if not wandb_upload:
+      print("Train")
     for batch in range(batches):
       data_3, data_2, adj_3, adj_2 = next(iter(train_dataloader))
       loss, params, opt, a, c, s = train_step(params, opt, args.lambda_2d,
@@ -263,8 +273,13 @@ def main(params, n_epochs):
             jxs.BCSR((s_i.data + s_new.data / batches, s_i.indices, s_i.indptr),
                      shape=s_i.shape) for s_i, s_new in zip(s_list, s)
         ]
-    data_3, data_2, adj_3, adj_2 = next(iter(test_dataloader))
-    test_err = test_step(params, a, c, s, data_3, data_2, adj_2)
+    if not wandb_upload:
+      print("Test")
+    test_err = 0
+    for test in range(n_test):
+      data_3, data_2, adj_3, adj_2 = next(iter(test_dataloader))
+      test_err = test_err + test_step(params, a, c, s, data_3, data_2,
+                                      adj_2) / n_test
     if epoch % 100 == 0 or epoch == n_epochs - 1:
       if wandb_upload:
         wandb.log({
@@ -275,9 +290,10 @@ def main(params, n_epochs):
       else:
         print("Loss: {:g}, Error {:g}, Epoch {:g}".format(
             loss, test_err, epoch))
-      check.save(
-          os.path.join(data_path, "models",
-                       case_name + "_ep-{:g}".format(epoch)), params)
+      check_path = os.path.join(data_path, "models", case_name + "_ep-{:g}".format(epoch), today.strftime("%d%m%y"))
+      if os.path.exists(check_path):
+        shutil.rmtree(check_path)
+      check.save(check_path, params)
 
 
 if __name__ == "__main__":
