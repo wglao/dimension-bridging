@@ -62,10 +62,11 @@ train_dataset = GraphDataset(data_path, ma_list, re_list, aoa_list, n_slices)
 test_dataset = GraphDataset(data_path, [0.2, 0.8], re_list, aoa_list, n_slices)
 
 n_samples = len(ma_list)*len(re_list)*len(aoa_list)
-batch_sz = 1
+batch_sz = 2
 batches = -(n_samples // -batch_sz)
 n_test = 2*len(re_list)*len(aoa_list)
-test_sz = 1
+test_sz = 2
+test_batches = -(n_test // -test_sz)
 
 train_dataloader = SpLoader(train_dataset, batch_sz, shuffle=True)
 test_dataloader = SpLoader(test_dataset, test_sz, shuffle=True)
@@ -101,7 +102,7 @@ check.save(check_path, params)
 
 tx = optax.adam(1e-3)
 
-n_epochs = 100000
+n_epochs = 10000
 
 eps = 1e-15
 
@@ -276,10 +277,10 @@ def main(params, n_epochs):
     if not wandb_upload:
       print("Test")
     test_err = 0
-    for test in range(n_test):
+    for test in range(test_batches):
       data_3, data_2, adj_3, adj_2 = next(iter(test_dataloader))
       test_err = test_err + test_step(params, a, c, s, data_3, data_2,
-                                      adj_2) / n_test
+                                      adj_2) / test_batches
     if epoch % 100 == 0 or epoch == n_epochs - 1:
       if wandb_upload:
         wandb.log({
