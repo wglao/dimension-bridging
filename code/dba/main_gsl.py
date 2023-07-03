@@ -66,10 +66,10 @@ train_dataset = GraphDataset(data_path, ma_list, re_list, aoa_list, n_slices)
 test_dataset = GraphDataset(data_path, [0.2, 0.8], re_list, aoa_list, n_slices)
 
 n_samples = len(ma_list)*len(re_list)*len(aoa_list)
-batch_sz = 2
+batch_sz = 8
 batches = -(n_samples // -batch_sz)
 n_test = 2*len(re_list)*len(aoa_list)
-test_sz = 2
+test_sz = 8
 test_batches = -(n_test // -test_sz)
 
 train_dataloader = SpLoader(train_dataset, batch_sz, shuffle=True)
