@@ -145,23 +145,23 @@ class GSLPoolLayer(nn.Module):
 
   @nn.compact
   def __call__(self, features, adjacency: jxs.BCSR):
-    n_keep = jnp.ceil(adjacency.shape[-1]*self.pool_ratio)
+    n_keep = jnp.ceil(adjacency.shape[-1]*self.pool_ratio).astype(int)
     gnn_p = MoNetLayer(1, self.dim)
-    p = nn.softmax(gnn_p(features, adjacency))
-    sort_i = jnp.argsort(p)
-    s = sort_i[-n_keep:]
+    p = nn.softmax(gnn_p(features, adjacency)[:,self.dim:], axis=0)
+    s = jnp.argsort(p[jnp.nonzero(p)])[-n_keep:]
 
     adj_bcoo = adjacency.to_bcoo()
     adj_slc_0 = jxs.bcoo_concatenate(
         vmap(lambda i: jxs.bcoo_dynamic_slice(
-            adj_bcoo, start_indices=(i, 0), slice_sizes=(1, adj_bcoo.shape[-1])
+            adj_bcoo, start_indices=(i.astype(int), 0), slice_sizes=(1, adj_bcoo.shape[-1])
         ))(s),
         dimension=0)
     adj_slc_1 = jxs.bcoo_concatenate(
         vmap(lambda i: jxs.bcoo_dynamic_slice(
-            adj_slc_0, start_indices=(0, i), slice_sizes=(adj_bcoo.shape[0], 1)
+            adj_slc_0, start_indices=(0, i.astype(int)), slice_sizes=(adj_bcoo.shape[0], 1)
         ))(s),
         dimension=-1)
+    import pdb; pdb.set_trace()
     del adj_bcoo
 
     gnn_f = MoNetLayer(features.shape[-1]-self.dim,self.dim)
