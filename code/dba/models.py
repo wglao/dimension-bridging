@@ -213,13 +213,17 @@ class TransAggLayer(nn.Module):
     return out
 
 
-class TransGSLPoolLayer(nn.Module):
+class TransGSLLayer(nn.Module):
+  channels: int = 32
   dim: int = 3
 
   @nn.compact
-  def __call__(self, features, adjacency, selection):
-    # TODO: this
-    pass
+  def __call__(self, features, node_coords, adjacency, selection):
+    f = jnp.zeros((adjacency.shape[-1],features.shape[-1]))
+    f = f.at[selection,self.dim:].set(features)
+    f = f.at[:,:self.dim].set(node_coords)
+    f = MoNetLayer(self.channels,self.dim)(f,adjacency)
+    return f
 
 class GraphEncoder(nn.Module):
   n_pools: int = 1
@@ -266,8 +270,11 @@ class GSLEncoder(GraphEncoder):
   def __call__(self, features, adjacency):
     a = []
     a_sp = []
+    c = []
     s = []
+    f_gsl = []
     a.append(adjacency)
+    c.append(features[:, :self.dim])
     f = self.act_no_coords(
         MoNetLayer(self.n_hidden_variables, self.dim)(features, a[-1]))
     for l in range(self.n_pools):
@@ -276,14 +283,16 @@ class GSLEncoder(GraphEncoder):
           pool_ratio=0.8, dim=self.dim)(f, a[-1])
       a.append(adj_co)
       a_sp.append(adj_sp)
+      c.append(f[:, :self.dim])
       s.append(selection)
+      f_gsl.append(f)
 
       f = self.act_no_coords(
           MoNetLayer(self.n_hidden_variables, self.dim)(f, a[-1]))
     
     f_latent = self.act(nn.Dense(self.n_hidden_variables)(f.ravel()))
     f_latent = nn.Dense(self.n_latent_variables)(f_latent)
-    return f_latent, a, a_sp, s
+    return f_latent, a, a_sp, c, s, f_gsl
 
 class GraphEncoderNoPooling(GraphEncoder):
 
@@ -342,9 +351,25 @@ class GraphDecoder(nn.Module):
 class GSLDecoder(GraphDecoder):
 
   @nn.compact
-  def __call__(self, f_latent, a_list, s_list):
-    # TODO:this
-    pass
+  def __call__(self, f_latent, a_list, c_list, s_list):
+    n_nodes = a_list[-1].shape[-1]
+
+    f = nn.Dense(self.n_hidden_variables)(f_latent)
+    f = self.act(nn.Dense(self.n_hidden_variables*n_nodes)(f))
+    f = jnp.reshape(f, (n_nodes, len(f) // n_nodes))
+    f = jnp.column_stack((c_list[-1], f))
+
+    for l in range(self.n_upsamples):
+      f = self.act_no_coords(
+          MoNetLayer(self.n_hidden_variables, self.dim)(f, a_list[-l - 1]))
+
+      f = TransGSLLayer(self.n_hidden_variables,
+                        self.dim)(f, c_list[-l - 2], a_list[-l - 2],
+                                  s_list[-l - 1])
+
+    f = self.act_no_coords(
+        MoNetLayer(self.n_final_variables, self.dim)(f, a_list[0]))
+    return f
 
 
 class GraphDecoderNoPooling(GraphDecoder):

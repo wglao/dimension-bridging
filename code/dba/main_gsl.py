@@ -13,11 +13,14 @@ parser.add_argument(
     "--latent-sz", default=10, type=int, help="Latent Space Dimensionality")
 parser.add_argument(
     "--pooling-layers", default=1, type=int, help="Number of Pooling Layers")
-parser.add_argument("--lambda-2d", default=1, type=float, help="2D Loss Weight")
 parser.add_argument(
-    "--lambda-dp", default=1, type=float, help="DiffPool Loss Weight")
+    "--lambda-0", default=0.0005, type=float, help="Feature Smoothness Weight")
+parser.add_argument(
+    "--lambda-1", default=0.1, type=float, help="Log Barrier Weight")
+parser.add_argument(
+    "--lambda-2", default=0.01, type=float, help="Adjacency Norm Weight")
 parser.add_argument("--wandb", default=0, type=int, help="wandb upload")
-parser.add_argument('--gpu-id', type=int, help="GPU index")
+parser.add_argument('--gpu-id', default=0, type=int, help="GPU index")
 
 args = parser.parse_args()
 wandb_upload = bool(args.wandb)
@@ -40,12 +43,13 @@ import pyvista as pv
 from torch.utils.data import DataLoader
 import orbax.checkpoint as orb
 
-from models import GraphEncoder, GraphDecoder, GraphEncoderNoPooling, GraphDecoderNoPooling
+from models import GraphEncoder, GraphDecoder, GSLEncoder, GSLDecoder, GraphEncoderNoPooling, GraphDecoderNoPooling
 from graphdata import GraphDataset, SpLoader
 from vtk2adj import v2a, combineAdjacency
 
 # loop through folders and load data
-ma_list = [0.2, 0.35, 0.5, 0.65, 0.8]
+# ma_list = [0.2, 0.35, 0.5, 0.65, 0.8]
+ma_list = [0.35, 0.5, 0.65]
 # ma_list = [0.5]
 re_list = [1e5, 1e6, 1e7, 1e8]
 # re_list = [1e5]
@@ -55,7 +59,7 @@ n_slices = 5
 data_path = os.path.join(os.environ["SCRATCH"], "ORNL/dimension-bridging/data")
 
 train_dataset = GraphDataset(data_path, ma_list, re_list, aoa_list, n_slices)
-test_dataset = GraphDataset(data_path, [0.8395], [1.172e7], [3.06], n_slices)
+test_dataset = GraphDataset(data_path, [0.2, 0.8], re_list, aoa_list, n_slices)
 
 n_samples = len(ma_list)*len(re_list)*len(aoa_list)
 batch_sz = 1
@@ -73,14 +77,23 @@ init_data_3, init_data_2, init_adj_3, init_adj_2 = [
     i[0] for i in next(iter(test_dataloader))
 ]
 
+# slices have 3d coords
+
 # ge_3 = GraphEncoder(n_pools, args.latent_sz, args.channels, dim=3)
-# ge_2 = GraphEncoder(n_pools, args.latent_sz, args.channels, dim=2)
-ge_3 = GraphEncoderNoPooling(n_pools, args.latent_sz, args.channels, dim=3)
-ge_2 = GraphEncoderNoPooling(
-    n_pools, args.latent_sz, args.channels, dim=3)  # slices have 3d coords
+# ge_2 = GraphEncoder(n_pools, args.latent_sz, args.channels, dim=3)
+
+ge_3 = GSLEncoder(n_pools, args.latent_sz, args.channels, dim=3)
+ge_2 = GSLEncoder(n_pools, args.latent_sz, args.channels, dim=3)
+
+# ge_3 = GraphEncoderNoPooling(n_pools, args.latent_sz, args.channels, dim=3)
+# ge_2 = GraphEncoderNoPooling(
+#     n_pools, args.latent_sz, args.channels, dim=3)
+
 final_sz = init_data_3.shape[-1] - 3
+
 # gd = GraphDecoder(n_pools, final_sz, args.channels, dim=3)
-gd = GraphDecoderNoPooling(n_pools, final_sz, args.channels, dim=3)
+gd = GSLDecoder(n_pools, final_sz, args.channels, dim=3)
+# gd = GraphDecoderNoPooling(n_pools, final_sz, args.channels, dim=3)
 
 pe_3 = ge_3.init(rng, init_data_3, init_adj_3)['params']
 pe_2 = ge_2.init(rng, init_data_2, init_adj_2)['params']
@@ -119,19 +132,31 @@ eps = 1e-15
 
 
 @jit
-def train_step(params, opt: optax.OptState, lam_2, lam_dp, data_3, data_2,
-               adj_3, adj_2):
+def train_step(params, opt: optax.OptState, lam_0, lam_1, lam_2, lam_2d, data_3,
+               data_2, adj_3, adj_2):
+
+  def get_loss_f(feats, adj_sp):
+    degr = jnp.diag(adj_sp @ jnp.ones((adj_sp.shape[-1], 1)))
+    lapl = degr - adj_sp
+    return jnp.sum(jnp.diag(feats.T @ lapl @ feats))
+
+  def get_loss_p(adj_sp):
+    p1 = jnp.ones((1, adj_sp.shape[0])) @ jnp.log(adj_sp @ jnp.ones(
+        (adj_sp.shape[-1], 1)))
+    p2 = jnp.sqrt(jnp.sum(jnp.square(adj_sp.data)))
+    return -lam_1*p1 + lam_2*p2/2
 
   def loss_fn(params, data_3, data_2, adj_3, adj_2):
     loss = 0
     for fb3, fb2, adj3, adj2 in zip(data_3, data_2, adj_3, adj_2):
-      fl3, a, c, s = ge_3.apply({'params': params[0]}, fb3, adj3)
-      fl2, _, _, _ = ge_2.apply({'params': params[1]}, fb2, adj2)
-      f = gd.apply({'params': params[2]}, fl3, a, c, s)
-      loss_ae = jnp.mean(jnp.square(f[:, 3:] - fb3[:, 3:]))
-      loss_2 = jnp.mean(jnp.square(fl2 - fl3))
 
-      # # WITH POOLING
+      # # DIFFPOOL
+      # fl3, a, c, s = ge_3.apply({'params': params[0]}, fb3, adj3)
+      # fl2, _, _, _ = ge_2.apply({'params': params[1]}, fb2, adj2)
+      # f = gd.apply({'params': params[2]}, fl3, a, c, s)
+      # loss_ae = jnp.mean(jnp.square(f[:, 3:] - fb3[:, 3:]))
+      # loss_2 = jnp.mean(jnp.square(fl2 - fl3))
+      #
       # loss_lp = jnp.mean(
       #     jnp.array(
       #         jtr.tree_map(
@@ -142,13 +167,26 @@ def train_step(params, opt: optax.OptState, lam_2, lam_dp, data_3, data_2,
       #         jtr.tree_map(
       #             lambda s: jnp.mean(jnp.sum(-s*jnp.exp(s + eps), axis=-1)),
       #             s)))
+      # loss = loss + (loss_ae + lam_2*loss_2 + lam_dp*
+      #                (loss_e+loss_lp)) / batch_sz
+
+      # # GSL POOL
+      fl3, a, as3, c, s3, fg3 = ge_3.apply({'params': params[0]}, fb3, adj3)
+      fl2, _, as2, _, _, fg2 = ge_2.apply({'params': params[1]}, fb2, adj2)
+      f = gd.apply({'params': params[2]}, fl3, a, c, s3)
+      loss_ae = jnp.mean(jnp.square(f[:, 3:] - fb3[:, 3:]))
+      loss_2d = jnp.mean(jnp.square(fl2 - fl3))
+
+      loss_f = jnp.mean(jnp.array(jtr.tree_map(get_loss_f, fg3, as3)))
+      loss_f = loss_f + jnp.mean(jnp.array(jtr.tree_map(get_loss_f, fg2, as2)))
+
+      loss_p = jnp.mean(jnp.array(jtr.tree_map(get_loss_p, as3)))
+      loss_p = loss_p + jnp.mean(jnp.array(jtr.tree_map(get_loss_p, as2)))
+      loss = loss + (loss_ae + lam_2d*loss_2d + lam_0*loss_f +
+                     loss_p) / batch_sz
 
       # NO POOLING:
-      loss_lp = 0
-      loss_e = 0
-
-      loss = loss + (loss_ae + lam_2*loss_2 + lam_dp*
-                     (loss_e+loss_lp)) / batch_sz
+      # loss = loss + (loss_ae + lam_2*loss_2) / batch_sz
     return loss
 
   loss = 0
@@ -219,16 +257,6 @@ def test_step(params, adj_list, coordinates, selection, data_3, data_2, adj_2):
   test_err = loss_fn(params, data_3, data_2, adj_2, adj_list, coordinates,
                      selection)
   return test_err
-
-
-# def getBatchIndices(indices, i):
-#   batch_indices = dsd(indices, i, batch_sz)
-#   return indices, batch_indices
-
-# # shuffle batches
-# batch_indices = scan(getBatchIndices,
-#                      jrn.shuffle(jrn.PRNGKey(epoch), indices),
-#                      jnp.arange(batches))
 
 
 def main(params, n_epochs):
