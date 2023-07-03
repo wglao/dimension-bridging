@@ -145,7 +145,7 @@ class GSLPoolLayer(nn.Module):
 
   @nn.compact
   def __call__(self, features, adjacency: jxs.BCSR):
-    n_keep = jnp.ceil(adjacency.shape[-1]*self.pool_factor)
+    n_keep = jnp.ceil(adjacency.shape[-1]*self.pool_ratio)
     gnn_p = MoNetLayer(1, self.dim)
     p = nn.softmax(gnn_p(features, adjacency))
     sort_i = jnp.argsort(p)
