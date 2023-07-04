@@ -51,9 +51,11 @@ from vtk2adj import v2a, combineAdjacency
 # ma_list = [0.2, 0.35, 0.5, 0.65, 0.8]
 ma_list = [0.35, 0.5, 0.65]
 # ma_list = [0.5]
-re_list = [1e5, 1e6, 1e7, 1e8]
+# re_list = [1e5, 1e6, 1e7, 1e8]
+re_list = [1e6, 1e7]
 # re_list = [1e5]
-aoa_list = [0, 2, 4, 6, 8, 10, 12]
+# aoa_list = [0, 2, 4, 6, 8, 10, 12]
+aoa_list = [0, 4, 8]
 # aoa_list = [0]
 n_slices = 5
 data_path = os.path.join(os.environ["SCRATCH"], "ORNL/dimension-bridging/data")
@@ -281,7 +283,7 @@ def main(params, n_epochs):
       data_3, data_2, adj_3, adj_2 = next(iter(test_dataloader))
       test_err = test_err + test_step(params, a, c, s, data_3, data_2,
                                       adj_2) / test_batches
-    if epoch % 100 == 0 or epoch == n_epochs - 1:
+    if epoch % 10 == 0 or epoch == n_epochs - 1:
       if wandb_upload:
         wandb.log({
             "Loss": loss,
