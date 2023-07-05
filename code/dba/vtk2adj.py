@@ -31,7 +31,7 @@ def v2a(mesh):
 
   adjacency = jxs.BCSR.from_bcoo(
       jxs.BCOO((data, indices), shape=(n_nodes, n_nodes)))
-  return adjacency
+  return adjacency.sum_duplicates()
 
 
 def combineAdjacency(adjs):
@@ -49,7 +49,7 @@ def combineAdjacency(adjs):
   data = jnp.concatenate([a.data for a in adjs], axis=None)
   adjacency = jxs.BCSR((data, indices, indptr),
                        shape=(int(out_sz), int(out_sz)))
-  return adjacency
+  return adjacency.sum_duplicates()
 
 
 if __name__ == "__main__":

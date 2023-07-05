@@ -97,7 +97,7 @@ pd = gd.init(rng, f_latent, a, c, s)['params']
 params = [pe_3, pe_2, pd]
 
 check = orb.PyTreeCheckpointer()
-check_path = os.path.join(data_path, "models", case_name + "_init", today.strftime("%d%m%y"))
+check_path = os.path.join(data_path, "models_save", case_name + "_init", today.strftime("%d%m%y"))
 if os.path.exists(check_path):
   shutil.rmtree(check_path)
 check.save(check_path, params)
@@ -293,7 +293,7 @@ def main(params, n_epochs):
       else:
         print("Loss: {:g}, Error {:g}, Epoch {:g}".format(
             loss, test_err, epoch))
-      check_path = os.path.join(data_path, "models", case_name + "_ep-{:g}".format(epoch), today.strftime("%d%m%y"))
+      check_path = os.path.join(data_path, "models_save", case_name + "_ep-{:g}".format(epoch), today.strftime("%d%m%y"))
       if os.path.exists(check_path):
         shutil.rmtree(check_path)
       check.save(check_path, params)
