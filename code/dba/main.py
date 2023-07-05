@@ -49,7 +49,7 @@ from vtk2adj import v2a, combineAdjacency
 
 # loop through folders and load data
 # ma_list = [0.2, 0.35, 0.5, 0.65, 0.8]
-ma_list = [0.35, 0.5, 0.65]
+ma_list = [0.35, 0.65]
 # ma_list = [0.5]
 # re_list = [1e5, 1e6, 1e7, 1e8]
 re_list = [1e6, 1e7]
@@ -61,12 +61,12 @@ n_slices = 5
 data_path = os.path.join(os.environ["SCRATCH"], "ORNL/dimension-bridging/data")
 
 train_dataset = GraphDataset(data_path, ma_list, re_list, aoa_list, n_slices)
-test_dataset = GraphDataset(data_path, [0.2, 0.8], re_list, aoa_list, n_slices)
+test_dataset = GraphDataset(data_path, [0.5], re_list, aoa_list, n_slices)
 
 n_samples = len(ma_list)*len(re_list)*len(aoa_list)
 batch_sz = 8
 batches = -(n_samples // -batch_sz)
-n_test = 2*len(re_list)*len(aoa_list)
+n_test = 1*len(re_list)*len(aoa_list)
 test_sz = 8
 test_batches = -(n_test // -test_sz)
 
