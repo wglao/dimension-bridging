@@ -160,13 +160,13 @@ class GSLPoolLayer(nn.Module):
         dimension=0)
     del adj_bcoo
     
-    import pdb; pdb.set_trace()
     adj_slc_1 = jxs.bcoo_concatenate(
         vmap(lambda i: jxs.bcoo_dynamic_slice(
             adj_slc_0, start_indices=(0, i.astype(int)), slice_sizes=(adj_slc_0.shape[0], 1)
         ))(s),
         dimension=-1)
     del adj_slc_0
+    import pdb; pdb.set_trace()
 
     gnn_f = MoNetLayer(features.shape[-1]-self.dim,self.dim)
     f = gnn_f(features, adjacency)[s]
