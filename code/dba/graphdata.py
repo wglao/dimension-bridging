@@ -85,8 +85,8 @@ class GraphDataset(data.Dataset):
     coords = np.array(mesh.points)
     train_data_3 = np.column_stack([coords] + [
         mesh.point_data.get_array(i)
-        # for i in ["Density", "Momentum", "Energy"]
-        for i in ["Density"]  # Density only for Memory
+        for i in ["Density", "Momentum", "Energy"]
+        # for i in ["Density"]  # Density only for Memory
     ])
     # [mesh.point_data.get_array(i) for i in range(mesh.n_arrays)]))
     train_adj_3 = v2a(mesh)

@@ -307,8 +307,10 @@ class GraphEncoderNoPooling(GraphEncoder):
     a.append(adjacency)
     c.append(features[:, :self.dim])
 
-    f = features
-    f = self.act_no_coords(
+    f = features[:, self.dim:]
+    f = features[:, self.dim:] + self.act_no_coords(
+        MoNetLayer(self.n_hidden_variables, self.dim)(f, a[-1]))
+    f = features[:, self.dim:] + self.act_no_coords(
         MoNetLayer(self.n_hidden_variables, self.dim)(f, a[-1]))
 
     f_latent = self.act(nn.Dense(self.n_hidden_variables)(f.ravel()))
@@ -331,24 +333,26 @@ class GraphDecoder(nn.Module):
   def __call__(self, f_latent, a_list, c_list, s_list):
     n_nodes = a_list[-1].shape[-1]
 
-    f = nn.Dense(self.n_hidden_variables)(f_latent)
+    f = self.act(nn.Dense(self.n_hidden_variables)(f_latent))
     f = self.act(nn.Dense(self.n_hidden_variables*n_nodes)(f))
     f = jnp.reshape(f, (n_nodes, len(f) // n_nodes))
     f = jnp.column_stack((c_list[-1], f))
 
+
+    f = f + self.act_no_coords(
+        MoNetLayer(self.n_final_variables, self.dim)(f, a_list[0]))
+    
     for l in range(self.n_upsamples):
-      f = self.act_no_coords(
+      f = f + self.act_no_coords(
           MoNetLayer(self.n_hidden_variables, self.dim)(f, a_list[-l - 1]))
-      # f = self.act_no_coords(
-      #     MoNetLayer(self.n_hidden_variables, self.dim)(f, a_list[-l - 1]))
 
       f = TransAggLayer(self.n_hidden_variables,
                         self.dim)(f, c_list[-l - 2], a_list[-l - 2],
                                   s_list[-l - 1])
 
-    f = self.act_no_coords(
+    f = f + self.act_no_coords(
         MoNetLayer(self.n_final_variables, self.dim)(f, a_list[0]))
-    # f = MoNetLayer(self.n_final_variables)(f, a_list[0])
+    f = f + MoNetLayer(self.n_final_variables)(f, a_list[0])
     return f
 
 
@@ -358,7 +362,7 @@ class GSLDecoder(GraphDecoder):
   def __call__(self, f_latent, a_list, c_list, s_list):
     n_nodes = a_list[-1].shape[-1]
 
-    f = nn.Dense(self.n_hidden_variables)(f_latent)
+    f = self.act(nn.Dense(self.n_hidden_variables)(f_latent))
     f = self.act(nn.Dense(self.n_hidden_variables*n_nodes)(f))
     f = jnp.reshape(f, (n_nodes, len(f) // n_nodes))
     f = jnp.column_stack((c_list[-1], f))
@@ -386,8 +390,13 @@ class GraphDecoderNoPooling(GraphDecoder):
     f = self.act(nn.Dense(self.n_hidden_variables*n_nodes)(f))
     f = jnp.reshape(f, (n_nodes, len(f) // n_nodes))
     f = jnp.column_stack((c_list[-1], f))
-    f = self.act_no_coords(
+    f0 = f
+
+    f = f0 + self.act_no_coords(
         MoNetLayer(self.n_final_variables, self.dim)(f, a_list[0]))
+    f = f0 + self.act_no_coords(
+        MoNetLayer(self.n_final_variables, self.dim)(f, a_list[0]))
+    f = f0 + MoNetLayer(self.n_final_variables, self.dim)(f, a_list[0])
     return f
 
 
