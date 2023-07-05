@@ -307,9 +307,8 @@ class GraphEncoderNoPooling(GraphEncoder):
     a.append(adjacency)
     c.append(features[:, :self.dim])
 
-    f = features[:, self.dim:]
     f = self.act_no_coords(
-        MoNetLayer(self.n_hidden_variables, self.dim)(f, a[-1]))
+        MoNetLayer(self.n_hidden_variables, self.dim)(features, a[-1]))
     f = self.act_no_coords(
         MoNetLayer(self.n_hidden_variables, self.dim)(f, a[-1]))
 
