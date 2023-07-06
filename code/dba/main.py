@@ -156,7 +156,6 @@ eps = 1e-15
 #   return a, c, s
 
 
-
 @jit
 def train_step(params, opt: optax.OptState, lam_2, lam_dp, data_3, data_2):
   loss = 0
@@ -220,8 +219,7 @@ def train_step(params, opt: optax.OptState, lam_2, lam_dp, data_3, data_2):
             p[layer][sublayer]['sigma'] = tmp
     params[i] = fd.freeze(p)
 
-  
-  _, a, c, s = ge_3.apply({'params': params[0]}, data_3, adj_3)
+  _, a, c, s = ge_3.apply({'params': params[0]}, data_3[0], adj_3)
 
   return loss, params, opt, a, c, s
 
@@ -286,7 +284,7 @@ def main(params, n_epochs):
             jxs.BCSR((s_i.data + s_new.data / batches, s_i.indices, s_i.indptr),
                      shape=s_i.shape) for s_i, s_new in zip(s_list, s)
         ]
-      
+
       a_list = [a.sum_duplicates() for a in a_list]
       s_list = [s.sum_duplicates() for s in s_list]
     if not wandb_upload:
@@ -314,5 +312,5 @@ def main(params, n_epochs):
 if __name__ == "__main__":
   if wandb_upload:
     import wandb
-    wandb.init(project="DB-GNN", entity="wglao", name="graph autoencoder")
+    wandb.init(project="DB-GNN", entity="wglao", name=case_name)
   main(params, n_epochs)
