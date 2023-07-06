@@ -53,22 +53,24 @@ from vtk2adj import v2a, combineAdjacency
 
 # loop through folders and load data
 # ma_list = [0.2, 0.35, 0.5, 0.65, 0.8]
-ma_list = [0.35, 0.5, 0.65]
+ma_list = [0.35, 0.65]
 # ma_list = [0.5]
-re_list = [1e5, 1e6, 1e7, 1e8]
+# re_list = [1e6, 2e6, 5e6, 1e7, 2e7]
+re_list = [1e6, 1e7]
 # re_list = [1e5]
-aoa_list = [0, 2, 4, 6, 8, 10, 12]
+# aoa_list = [0, 3, 6, 9, 12]
+aoa_list = [0, 6]
 # aoa_list = [0]
 n_slices = 5
 data_path = os.path.join(os.environ["SCRATCH"], "ORNL/dimension-bridging/data")
 
 train_dataset = GraphDataset(data_path, ma_list, re_list, aoa_list, n_slices)
-test_dataset = GraphDataset(data_path, [0.2, 0.8], re_list, aoa_list, n_slices)
+test_dataset = GraphDataset(data_path, [0.5], re_list, aoa_list, n_slices)
 
 n_samples = len(ma_list)*len(re_list)*len(aoa_list)
 batch_sz = 8
 batches = -(n_samples // -batch_sz)
-n_test = 2*len(re_list)*len(aoa_list)
+n_test = 1*len(re_list)*len(aoa_list)
 test_sz = 8
 test_batches = -(n_test // -test_sz)
 
@@ -78,10 +80,21 @@ test_dataloader = SpLoader(test_dataset, test_sz, shuffle=True)
 rng = jrn.PRNGKey(1)
 n_pools = args.pooling_layers
 
-# init_data_3, init_adj_3, init_data_2, init_adj_2 = [i[0] for i in next(iter(train_dataloader))]
-init_data_3, init_data_2, init_adj_3, init_adj_2 = [
-    i[0] for i in next(iter(test_dataloader))
-]
+mesh = pv.read(os.path.join(data_path, "flow.vtu"))
+adj_3 = v2a(mesh)
+
+n_slices = 5
+slice_adj = []
+for s in range(n_slices):
+  mesh = pv.read(
+      os.path.join(
+          data_path, "ma_{:g}/re_{:g}/a_{:g}".format(ma_list[0], re_list[0],
+                                                     aoa_list[0]),
+          "slice_{:d}.vtk".format(s)))
+  slice_adj.append(v2a(mesh))
+adj_2 = combineAdjacency(slice_adj)
+
+init_data_3, init_data_2 = [i[0] for i in next(iter(test_dataloader))]
 
 # slices have 3d coords
 
@@ -101,14 +114,14 @@ final_sz = init_data_3.shape[-1] - 3
 gd = GSLDecoder(n_pools, final_sz, args.channels, dim=3)
 # gd = GraphDecoderNoPooling(n_pools, final_sz, args.channels, dim=3)
 
-pe_3 = ge_3.init(rng, init_data_3, init_adj_3)['params']
-pe_2 = ge_2.init(rng, init_data_2, init_adj_2)['params']
-f_latent, a, c, s = ge_3.apply({'params': pe_3}, init_data_3, init_adj_3)
+pe_3 = ge_3.init(rng, init_data_3, adj_3)['params']
+pe_2 = ge_2.init(rng, init_data_2, adj_2)['params']
+f_latent, a, c, s = ge_3.apply({'params': pe_3}, init_data_3, adj_3)
 pd = gd.init(rng, f_latent, a, c, s)['params']
 params = [pe_3, pe_2, pd]
 
 check = orb.PyTreeCheckpointer()
-check_path = os.path.join(data_path, "models", case_name + "_init", today.strftime("%d%m%y"))
+check_path = os.path.join(data_path, "models_save", case_name + "_init", today.strftime("%d%m%y"))
 if os.path.exists(check_path):
   shutil.rmtree(check_path)
 check.save(check_path, params)
@@ -142,7 +155,7 @@ eps = 1e-15
 
 @jit
 def train_step(params, opt: optax.OptState, lam_0, lam_1, lam_2, lam_2d, data_3,
-               data_2, adj_3, adj_2):
+               data_2):
 
   def get_loss_f(feats, adj_sp):
     degr = jnp.diag(adj_sp @ jnp.ones((adj_sp.shape[-1], 1)))
@@ -155,9 +168,9 @@ def train_step(params, opt: optax.OptState, lam_0, lam_1, lam_2, lam_2d, data_3,
     p2 = jnp.sqrt(jnp.sum(jnp.square(adj_sp.data)))
     return -lam_1*p1 + lam_2*p2/2
 
-  def loss_fn(params, data_3, data_2, adj_3, adj_2):
+  def loss_fn(params, data_3, data_2):
     loss = 0
-    for fb3, fb2, adj3, adj2 in zip(data_3, data_2, adj_3, adj_2):
+    for fb3, fb2 in zip(data_3, data_2):
 
       # # DIFFPOOL
       # fl3, a, c, s = ge_3.apply({'params': params[0]}, fb3, adj3)
@@ -180,8 +193,8 @@ def train_step(params, opt: optax.OptState, lam_0, lam_1, lam_2, lam_2d, data_3,
       #                (loss_e+loss_lp)) / batch_sz
 
       # # GSL POOL
-      fl3, a, as3, c, s3, fg3 = ge_3.apply({'params': params[0]}, fb3, adj3)
-      fl2, _, as2, _, _, fg2 = ge_2.apply({'params': params[1]}, fb2, adj2)
+      fl3, a, as3, c, s3, fg3 = ge_3.apply({'params': params[0]}, fb3, adj_3)
+      fl2, _, as2, _, _, fg2 = ge_2.apply({'params': params[1]}, fb2, adj_2)
       f = gd.apply({'params': params[2]}, fl3, a, c, s3)
       loss_ae = jnp.mean(jnp.square(f[:, 3:] - fb3[:, 3:]))
       loss_2d = jnp.mean(jnp.square(fl2 - fl3))
@@ -202,8 +215,8 @@ def train_step(params, opt: optax.OptState, lam_0, lam_1, lam_2, lam_2d, data_3,
   a_list = []
   c_list = []
   s_list = []
-  sample_loss = loss_fn(params, data_3, data_2, adj_3, adj_2)
-  grads = grad(loss_fn)(params, data_3, data_2, adj_3, adj_2)
+  sample_loss = loss_fn(params, data_3, data_2)
+  grads = grad(loss_fn)(params, data_3, data_2)
   # grads = grad(loss_fn)(params, features, adjacency)
   updates, opt = tx.update(grads, opt, params)
   params = optax.apply_updates(params, updates)
@@ -225,8 +238,8 @@ def train_step(params, opt: optax.OptState, lam_0, lam_1, lam_2, lam_2d, data_3,
     params[i] = fd.freeze(p)
 
   loss = loss + sample_loss/batch_sz
-  for d3, a3 in zip(data_3, adj_3):
-    _, a, c, s = ge_3.apply({'params': params[0]}, d3, a3)
+  for d3 in data_3:
+    _, a, c, s = ge_3.apply({'params': params[0]}, d3, adj_3)
     if a_list == []:
       a_list = [
           jxs.BCSR((a_i.data / batch_sz, a_i.indices, a_i.indptr),
@@ -252,18 +265,18 @@ def train_step(params, opt: optax.OptState, lam_0, lam_1, lam_2, lam_2d, data_3,
 
 
 @jit
-def test_step(params, adj_list, coordinates, selection, data_3, data_2, adj_2):
+def test_step(params, adj_list, coordinates, selection, data_3, data_2):
   # @jit
-  def loss_fn(params, data_3, data_2, adj_2, adj_list, coordinates, selection):
+  def loss_fn(params, data_3, data_2, adj_list, coordinates, selection):
     loss = 0
-    for fb3, fb2, adj2 in zip(data_3, data_2, adj_2):
-      fl2, _, _, _ = ge_2.apply({'params': params[1]}, fb2, adj2)
+    for fb3, fb2 in zip(data_3, data_2):
+      fl2, _, _, _ = ge_2.apply({'params': params[1]}, fb2, adj_2)
       f = gd.apply({'params': params[2]}, fl2, adj_list, coordinates, selection)
       loss_ae = jnp.mean(jnp.square(f[:, 3:] - fb3[:, 3:]))
       loss = loss + loss_ae/test_sz
     return loss
 
-  test_err = loss_fn(params, data_3, data_2, adj_2, adj_list, coordinates,
+  test_err = loss_fn(params, data_3, data_2, adj_list, coordinates,
                      selection)
   return test_err
 
@@ -276,7 +289,7 @@ def main(params, n_epochs):
     c_list = []
     s_list = []
     for batch in range(batches):
-      data_3, data_2, adj_3, adj_2 = next(iter(train_dataloader))
+      data_3, data_2 = next(iter(train_dataloader))
       loss, params, opt, a, c, s = train_step(params, opt, args.lambda_2d,
                                               args.lambda_dp, data_3, data_2,
                                               adj_3, adj_2)
@@ -302,7 +315,7 @@ def main(params, n_epochs):
         ]
     test_err = 0
     for test in range(test_batches):
-      data_3, data_2, adj_3, adj_2 = next(iter(test_dataloader))
+      data_3, data_2 = next(iter(test_dataloader))
       test_err = test_err + test_step(params, a, c, s, data_3, data_2,
                                       adj_2) / test_batches
     if epoch % 100 == 0 or epoch == n_epochs - 1:
