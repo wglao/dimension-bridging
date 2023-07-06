@@ -10,12 +10,13 @@ parser = argparse.ArgumentParser()
 parser.add_argument(
     "--case-name", default="dba", type=str, help="Architecture Name")
 parser.add_argument(
-    "--channels", default=10, type=int, help="Aggregation Channels")
+    "--channels", default=50, type=int, help="Aggregation Channels")
 parser.add_argument(
-    "--latent-sz", default=10, type=int, help="Latent Space Dimensionality")
+    "--latent-sz", default=50, type=int, help="Latent Space Dimensionality")
 parser.add_argument(
     "--pooling-layers", default=1, type=int, help="Number of Pooling Layers")
-parser.add_argument("--lambda-2d", default=1, type=float, help="2D Loss Weight")
+parser.add_argument(
+    "--lambda-2d", default=0.01, type=float, help="2D Loss Weight")
 parser.add_argument(
     "--lambda-dp", default=1, type=float, help="DiffPool Loss Weight")
 parser.add_argument("--wandb", default=0, type=int, help="wandb upload")
@@ -44,18 +45,18 @@ from torch.utils.data import DataLoader
 import orbax.checkpoint as orb
 
 from models import GraphEncoder, GraphDecoder, GraphEncoderNoPooling, GraphDecoderNoPooling
-from graphdata import GraphDataset, SpLoader
+from graphdata import GraphDataset, GraphLoader
 from vtk2adj import v2a, combineAdjacency
 
 # loop through folders and load data
 # ma_list = [0.2, 0.35, 0.5, 0.65, 0.8]
-ma_list = [0.35, 0.65]
+ma_list = [0.2, 0.35]
 # ma_list = [0.5]
 # re_list = [1e6, 2e6, 5e6, 1e7, 2e7]
 re_list = [1e6, 1e7]
 # re_list = [1e5]
 # aoa_list = [0, 3, 6, 9, 12]
-aoa_list = [0, 6]
+aoa_list = [3, 6, 9]
 # aoa_list = [0]
 n_slices = 5
 data_path = os.path.join(os.environ["SCRATCH"], "ORNL/dimension-bridging/data")
@@ -70,13 +71,17 @@ n_test = 1*len(re_list)*len(aoa_list)
 test_sz = 8
 test_batches = -(n_test // -test_sz)
 
-train_dataloader = SpLoader(train_dataset, batch_sz, shuffle=True)
-test_dataloader = SpLoader(test_dataset, test_sz, shuffle=True)
+# train_dataloader = SpLoader(train_dataset, batch_sz, shuffle=True)
+train_dataloader = GraphLoader(train_dataset, n_samples, shuffle=True)
+test_dataloader = GraphLoader(test_dataset, n_test, shuffle=True)
 
 rng = jrn.PRNGKey(1)
 n_pools = args.pooling_layers
 
-mesh = pv.read(os.path.join(data_path, "flow.vtu"))
+mesh = pv.read(
+    os.path.join(
+        data_path, "ma_{:g}/re_{:g}/a_{:g}".format(ma_list[0], re_list[0],
+                                                   aoa_list[0]), "flow.vtu"))
 adj_3 = v2a(mesh)
 
 n_slices = 5
@@ -90,7 +95,10 @@ for s in range(n_slices):
   slice_adj.append(v2a(mesh))
 adj_2 = combineAdjacency(slice_adj)
 
-init_data_3, init_data_2 = [i[0] for i in next(iter(test_dataloader))]
+train_data_3, train_data_2 = next(iter(train_dataloader))
+test_data_3, test_data_2 = next(iter(test_dataloader))
+init_data_3 = test_data_3[0]
+init_data_2 = test_data_2[0]
 
 # ge_3 = GraphEncoder(n_pools, args.latent_sz, args.channels, dim=3)
 # ge_2 = GraphEncoder(n_pools, args.latent_sz, args.channels, dim=2)
@@ -107,12 +115,19 @@ f_latent, a, c, s = ge_3.apply({'params': pe_3}, init_data_3, adj_3)
 pd = gd.init(rng, f_latent, a, c, s)['params']
 params = [pe_3, pe_2, pd]
 
-check = orb.PyTreeCheckpointer()
-check_path = os.path.join(data_path, "models_save", case_name + "_init",
+check_path = os.path.join(data_path, "models_save", case_name,
                           today.strftime("%d%m%y"))
 if os.path.exists(check_path):
   shutil.rmtree(check_path)
-check.save(check_path, params)
+options = orb.CheckpointManagerOptions(max_to_keep=3, save_interval_steps=10)
+ckptr = orb.CheckpointManager(
+    check_path, {
+        "params": orb.PyTreeCheckpointer(),
+        "state": orb.PyTreeCheckpointer()
+    },
+    options=options)
+
+# ckptr.save(check_path, params)
 
 tx = optax.adam(1e-3)
 
@@ -143,45 +158,50 @@ eps = 1e-15
 
 @jit
 def train_step(params, opt: optax.OptState, lam_2, lam_dp, data_3, data_2):
+  loss = 0
 
   def loss_fn(params, data_3, data_2):
     loss = 0
-    for fb3, fb2 in zip(data_3, data_2):
-      fl3, a, c, s = ge_3.apply({'params': params[0]}, fb3, adj_3)
-      fl2, _, _, _ = ge_2.apply({'params': params[1]}, fb2, adj_2)
-      f = gd.apply({'params': params[2]}, fl3, a, c, s)
-      loss_ae = jnp.mean(jnp.square(f[:, 3:] - fb3[:, 3:]))
-      loss_2 = jnp.mean(jnp.square(fl2 - fl3))
+    fl3, a, c, s = ge_3.apply({'params': params[0]}, data_3, adj_3)
+    fl2, _, _, _ = ge_2.apply({'params': params[1]}, data_2, adj_2)
+    f = gd.apply({'params': params[2]}, fl3, a, c, s)
+    loss_ae = jnp.mean(jnp.square(f[:, 3:] - data_3[:, 3:]))
+    loss_2 = jnp.mean(jnp.square(fl2 - fl3))
 
-      # # WITH POOLING
-      # loss_lp = jnp.mean(
-      #     jnp.array(
-      #         jtr.tree_map(
-      #             lambda a, s: jnp.sqrt(jnp.sum(jnp.square(a - s @ s.T))),
-      #             a[:-1], s)))
-      # loss_e = jnp.mean(
-      #     jnp.array(
-      #         jtr.tree_map(
-      #             lambda s: jnp.mean(jnp.sum(-s*jnp.exp(s + eps), axis=-1)),
-      #             s)))
+    # # WITH POOLING
+    # loss_lp = jnp.mean(
+    #     jnp.array(
+    #         jtr.tree_map(
+    #             lambda a, s: jnp.sqrt(jnp.sum(jnp.square(a - s @ s.T))),
+    #             a[:-1], s)))
+    # loss_e = jnp.mean(
+    #     jnp.array(
+    #         jtr.tree_map(
+    #             lambda s: jnp.mean(jnp.sum(-s*jnp.exp(s + eps), axis=-1)),
+    #             s)))
 
-      # NO POOLING:
-      loss_lp = 0
-      loss_e = 0
+    # NO POOLING:
+    loss_lp = 0
+    loss_e = 0
 
-      loss = loss + (loss_ae + lam_2*loss_2 + lam_dp*
-                     (loss_e+loss_lp)) / batch_sz
+    loss = loss + (loss_ae + lam_2*loss_2 + lam_dp*(loss_e+loss_lp)) / batch_sz
     return loss
 
-  loss = 0
-  a_list = []
-  c_list = []
-  s_list = []
-  sample_loss = loss_fn(params, data_3, data_2, adj_3, adj_2)
-  grads = grad(loss_fn)(params, data_3, data_2, adj_3, adj_2)
-  # grads = grad(loss_fn)(params, features, adjacency)
-  updates, opt = tx.update(grads, opt, params)
-  params = optax.apply_updates(params, updates)
+  data_3_batched = vmap(
+      dsd, in_axes=(None, 0, None))(data_3, jnp.arange(batches)*batch_sz,
+                                    batch_sz)
+  data_2_batched = vmap(
+      dsd, in_axes=(None, 0, None))(data_2, jnp.arange(batches)*batch_sz,
+                                    batch_sz)
+  for (batch_3, batch_2) in zip(data_3_batched, data_2_batched):
+    sample_loss = vmap(loss_fn, in_axes=(None, 0, 0))(params, batch_3, batch_2)
+    batch_loss = jnp.mean(sample_loss, axis=0)
+    loss = loss + batch_loss/batches
+
+    grads = vmap(grad(loss_fn), in_axes=(None, 0, 0))(params, batch_3, batch_2)
+    grads = jtr.tree_map(lambda g: jnp.mean(g, axis=0), grads)
+    updates, opt = tx.update(grads, opt, params)
+    params = optax.apply_updates(params, updates)
 
   # ensure covariances are always positive semi-definite
   for i in range(len(params)):
@@ -199,29 +219,44 @@ def train_step(params, opt: optax.OptState, lam_2, lam_dp, data_3, data_2):
             p[layer][sublayer]['sigma'] = tmp
     params[i] = fd.freeze(p)
 
-  loss = loss + sample_loss/batch_sz
-  for d3 in data_3:
-    _, a, c, s = ge_3.apply({'params': params[0]}, d3, adj_3)
-    if a_list == []:
-      a_list = [
-          jxs.BCSR((a_i.data / batch_sz, a_i.indices, a_i.indptr),
-                   shape=a_i.shape) for a_i in a
-      ]
-      c_list = jtr.tree_map(lambda c_i: c_i / batch_sz, c)
-      s_list = [
-          jxs.BCSR((s_i.data / batch_sz, s_i.indices, s_i.indptr),
-                   shape=s_i.shape) for s_i in s
-      ]
-    else:
-      a_list = [
-          jxs.BCSR((a_i.data + a_new.data / batch_sz, a_i.indices, a_i.indptr),
-                   shape=a_i.shape) for a_i, a_new in zip(a_list, a)
-      ]
-      c_list = jtr.tree_map(lambda c_i, c_new: c_i + c_new/batch_sz, c_list, c)
-      s_list = [
-          jxs.BCSR((s_i.data + s_new.data / batch_sz, s_i.indices, s_i.indptr),
-                   shape=s_i.shape) for s_i, s_new in zip(s_list, s)
-      ]
+  def get_acs(params, data_3):
+    a_list = []
+    c_list = []
+    s_list = []
+    for d3 in data_3:
+      _, a, c, s = ge_3.apply({'params': params[0]}, d3, adj_3)
+      if a_list == []:
+        a_list = [
+            jxs.BCSR.from_bcoo(
+                jxs.BCOO((a_i.data / batch_sz, a_i.indices), shape=a_i.shape))
+            for a_i in [a_j.to_bcoo().sum_duplicates() for a_j in a]
+        ]
+        c_list = jtr.tree_map(lambda c_i: c_i / batch_sz, c)
+        s_list = [
+            jxs.BCSR.from_bcoo(
+                jxs.BCOO((s_i.data / batch_sz, s_i.indices), shape=s_i.shape))
+            for s_i in [s_j.to_bcoo().sum_duplicates() for s_j in s]
+        ]
+      else:
+        a_list = [
+            jxs.BCSR.from_bcoo(
+                jxs.BCOO(
+                    (a_i.data + a_new.data / batch_sz, a_i.indices),
+                    shape=a_i.shape)) for a_i, a_new in zip(
+                        a_list, [a_j.to_bcoo().sum_duplicates() for a_j in a])
+        ]
+        c_list = jtr.tree_map(lambda c_i, c_new: c_i + c_new/batch_sz, c_list,
+                              c)
+        s_list = [
+            jxs.BCSR.from_bcoo(
+                jxs.BCOO(
+                    (s_i.data + s_new.data / batch_sz, s_i.indices),
+                    shape=s_i.shape)) for s_i, s_new in zip(
+                        s_list, [s_j.to_bcoo().sum_duplicates() for s_j in s])
+        ]
+    return a_list, c_list, s_list
+
+  a_list, c_list, s_list = get_acs(params, data_3)
 
   return loss, params, opt, a_list, c_list, s_list
 
@@ -230,15 +265,16 @@ def train_step(params, opt: optax.OptState, lam_2, lam_dp, data_3, data_2):
 def test_step(params, adj_list, coordinates, selection, data_3, data_2):
   # @jit
   def loss_fn(params, data_3, data_2, adj_list, coordinates, selection):
-    loss = 0
-    for fb3, fb2 in zip(data_3, data_2):
-      fl2, _, _, _ = ge_2.apply({'params': params[1]}, fb2, adj_2)
-      f = gd.apply({'params': params[2]}, fl2, adj_list, coordinates, selection)
-      loss_ae = jnp.mean(jnp.square(f[:, 3:] - fb3[:, 3:]))
-      loss = loss + loss_ae/test_sz
-    return loss
+    fl2, _, _, _ = ge_2.apply({'params': params[1]}, data_2, adj_2)
+    f = gd.apply({'params': params[2]}, fl2, adj_list, coordinates, selection)
+    loss_ae = jnp.mean(jnp.square(f[:, 3:] - data_3[:, 3:]))
+    return loss_ae
 
-  test_err = loss_fn(params, data_3, data_2, adj_list, coordinates, selection)
+  test_err = vmap(
+      loss_fn,
+      in_axes=(None, 0, 0, None, None, None))(params, data_3, data_2, adj_list,
+                                              coordinates, selection)
+  test_err = jnp.mean(test_err, axis=0)
   return test_err
 
 
@@ -262,9 +298,9 @@ def main(params, n_epochs):
     if not wandb_upload:
       print("Train")
     for batch in range(batches):
-      data_3, data_2 = next(iter(train_dataloader))
       loss, params, opt, a, c, s = train_step(params, opt, args.lambda_2d,
-                                              args.lambda_dp, data_3, data_2)
+                                              args.lambda_dp, train_data_3,
+                                              train_data_2)
       if a_list == []:
         a_list = [
             jxs.BCSR((a_i.data / batches, a_i.indices, a_i.indptr),
@@ -287,11 +323,7 @@ def main(params, n_epochs):
         ]
     if not wandb_upload:
       print("Test")
-    test_err = 0
-    for test in range(test_batches):
-      data_3, data_2 = next(iter(test_dataloader))
-      test_err = test_err + test_step(params, a, c, s, data_3,
-                                      data_2) / test_batches
+    test_err = test_step(params, a, c, s, test_data_3, test_data_2)
     if epoch % 10 == 0 or epoch == n_epochs - 1:
       if wandb_upload:
         wandb.log({
@@ -302,12 +334,13 @@ def main(params, n_epochs):
       else:
         print("Loss: {:g}, Error {:g}, Epoch {:g}".format(
             loss, test_err, epoch))
-      check_path = os.path.join(data_path, "models_save",
-                                case_name + "_ep-{:g}".format(epoch),
-                                today.strftime("%d%m%y"))
-      if os.path.exists(check_path):
-        shutil.rmtree(check_path)
-      check.save(check_path, params)
+    ckptr.save(epoch, {
+        "params": params,
+        "state": {
+            "Loss": loss,
+            "Error": test_err
+        }
+    })
 
 
 if __name__ == "__main__":

@@ -80,7 +80,10 @@ test_dataloader = SpLoader(test_dataset, test_sz, shuffle=True)
 rng = jrn.PRNGKey(1)
 n_pools = args.pooling_layers
 
-mesh = pv.read(os.path.join(data_path, "flow.vtu"))
+mesh = pv.read(
+    os.path.join(
+        data_path, "ma_{:g}/re_{:g}/a_{:g}".format(ma_list[0], re_list[0],
+                                                   aoa_list[0]), "flow.vtu"))
 adj_3 = v2a(mesh)
 
 n_slices = 5
@@ -121,7 +124,8 @@ pd = gd.init(rng, f_latent, a, c, s)['params']
 params = [pe_3, pe_2, pd]
 
 check = orb.PyTreeCheckpointer()
-check_path = os.path.join(data_path, "models_save", case_name + "_init", today.strftime("%d%m%y"))
+check_path = os.path.join(data_path, "models_save", case_name + "_init",
+                          today.strftime("%d%m%y"))
 if os.path.exists(check_path):
   shutil.rmtree(check_path)
 check.save(check_path, params)
@@ -276,8 +280,7 @@ def test_step(params, adj_list, coordinates, selection, data_3, data_2):
       loss = loss + loss_ae/test_sz
     return loss
 
-  test_err = loss_fn(params, data_3, data_2, adj_list, coordinates,
-                     selection)
+  test_err = loss_fn(params, data_3, data_2, adj_list, coordinates, selection)
   return test_err
 
 
@@ -328,7 +331,9 @@ def main(params, n_epochs):
       else:
         print("Loss: {:g}, Error {:g}, Epoch {:g}".format(
             loss, test_err, epoch))
-      check_path = os.path.join(data_path, "models", case_name + "_ep-{:g}".format(epoch), today.strftime("%d%m%y"))
+      check_path = os.path.join(data_path, "models",
+                                case_name + "_ep-{:g}".format(epoch),
+                                today.strftime("%d%m%y"))
       if os.path.exists(check_path):
         shutil.rmtree(check_path)
       check.save(check_path, params)

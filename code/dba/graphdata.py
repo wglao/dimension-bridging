@@ -33,7 +33,7 @@ def jxsSpCollate(batch):
   return batch
 
 
-class SpLoader(data.DataLoader):
+class GraphLoader(data.DataLoader):
 
   def __init__(self,
                dataset,
@@ -99,8 +99,8 @@ class GraphDataset(data.Dataset):
       slice_data.append(
           np.column_stack([coords] + [
               mesh.point_data.get_array(i)
-              # for i in ["Density", "Momentum", "Energy"]
-              for i in ["Density"]  # Density only for Memory
+              for i in ["Density", "Momentum", "Energy"]
+              # for i in ["Density"]  # Density only for Memory
           ]))
       slice_adj.append(v2a(mesh))
     train_data_2 = np.concatenate(slice_data, axis=0)
