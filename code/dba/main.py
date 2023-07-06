@@ -71,7 +71,6 @@ n_test = 1*len(re_list)*len(aoa_list)
 test_sz = 8
 test_batches = -(n_test // -test_sz)
 
-# train_dataloader = SpLoader(train_dataset, batch_sz, shuffle=True)
 train_dataloader = GraphLoader(train_dataset, n_samples, shuffle=True)
 test_dataloader = GraphLoader(test_dataset, n_test, shuffle=True)
 
@@ -203,21 +202,21 @@ def train_step(params, opt: optax.OptState, lam_2, lam_dp, data_3, data_2):
     updates, opt = tx.update(grads, opt, params)
     params = optax.apply_updates(params, updates)
 
-  # ensure covariances are always positive semi-definite
-  for i in range(len(params)):
-    p = fd.unfreeze(params[i])
-    for layer in params[i].keys():
-      if 'MoNetLayer' in layer:
-        tmp = p[layer]['sigma']
-        tmp = jnp.where(tmp > eps, tmp, eps)
-        p[layer]['sigma'] = tmp
-      else:
-        for sublayer in params[i][layer].keys():
-          if 'MoNetLayer' in sublayer:
-            tmp = p[layer][sublayer]['sigma']
-            tmp = jnp.where(tmp > eps, tmp, eps)
-            p[layer][sublayer]['sigma'] = tmp
-    params[i] = fd.freeze(p)
+    # ensure covariances are always positive semi-definite
+    for i in range(len(params)):
+      p = fd.unfreeze(params[i])
+      for layer in params[i].keys():
+        if 'MoNetLayer' in layer:
+          tmp = p[layer]['sigma']
+          tmp = jnp.where(tmp > eps, tmp, eps)
+          p[layer]['sigma'] = tmp
+        else:
+          for sublayer in params[i][layer].keys():
+            if 'MoNetLayer' in sublayer:
+              tmp = p[layer][sublayer]['sigma']
+              tmp = jnp.where(tmp > eps, tmp, eps)
+              p[layer][sublayer]['sigma'] = tmp
+      params[i] = fd.freeze(p)
 
   _, a, c, s = ge_3.apply({'params': params[0]}, data_3[0], adj_3)
 

@@ -8,7 +8,7 @@ import argparse
 parser = argparse.ArgumentParser()
 
 parser.add_argument(
-    "--case-name", default="dba", type=str, help="Architecture Name")
+    "--case-name", default="dba-gsl", type=str, help="Architecture Name")
 parser.add_argument(
     "--channels", default=10, type=int, help="Aggregation Channels")
 parser.add_argument(
@@ -48,18 +48,18 @@ from torch.utils.data import DataLoader
 import orbax.checkpoint as orb
 
 from models import GraphEncoder, GraphDecoder, GSLEncoder, GSLDecoder, GraphEncoderNoPooling, GraphDecoderNoPooling
-from graphdata import GraphDataset, SpLoader
+from graphdata import GraphDataset, GraphLoader
 from vtk2adj import v2a, combineAdjacency
 
 # loop through folders and load data
 # ma_list = [0.2, 0.35, 0.5, 0.65, 0.8]
-ma_list = [0.35, 0.65]
+ma_list = [0.2, 0.35]
 # ma_list = [0.5]
 # re_list = [1e6, 2e6, 5e6, 1e7, 2e7]
 re_list = [1e6, 1e7]
 # re_list = [1e5]
 # aoa_list = [0, 3, 6, 9, 12]
-aoa_list = [3, 6, 9, 12]
+aoa_list = [3, 6, 9]
 # aoa_list = [0]
 n_slices = 5
 data_path = os.path.join(os.environ["SCRATCH"], "ORNL/dimension-bridging/data")
@@ -74,8 +74,8 @@ n_test = 1*len(re_list)*len(aoa_list)
 test_sz = 8
 test_batches = -(n_test // -test_sz)
 
-train_dataloader = SpLoader(train_dataset, batch_sz, shuffle=True)
-test_dataloader = SpLoader(test_dataset, test_sz, shuffle=True)
+train_dataloader = GraphLoader(train_dataset, n_samples, shuffle=True)
+test_dataloader = GraphLoader(test_dataset, n_test, shuffle=True)
 
 rng = jrn.PRNGKey(1)
 n_pools = args.pooling_layers
@@ -97,7 +97,10 @@ for s in range(n_slices):
   slice_adj.append(v2a(mesh))
 adj_2 = combineAdjacency(slice_adj)
 
-init_data_3, init_data_2 = [i[0] for i in next(iter(test_dataloader))]
+train_data_3, train_data_2 = next(iter(train_dataloader))
+test_data_3, test_data_2 = next(iter(test_dataloader))
+init_data_3 = test_data_3[0]
+init_data_2 = test_data_2[0]
 
 # slices have 3d coords
 
@@ -119,16 +122,21 @@ gd = GSLDecoder(n_pools, final_sz, args.channels, dim=3)
 
 pe_3 = ge_3.init(rng, init_data_3, adj_3)['params']
 pe_2 = ge_2.init(rng, init_data_2, adj_2)['params']
-f_latent, a, c, s = ge_3.apply({'params': pe_3}, init_data_3, adj_3)
+f_latent, a, _, c, s, _ = ge_3.apply({'params': pe_3}, init_data_3, adj_3)
 pd = gd.init(rng, f_latent, a, c, s)['params']
 params = [pe_3, pe_2, pd]
 
-check = orb.PyTreeCheckpointer()
-check_path = os.path.join(data_path, "models_save", case_name + "_init",
+check_path = os.path.join(data_path, "models_save", case_name,
                           today.strftime("%d%m%y"))
 if os.path.exists(check_path):
   shutil.rmtree(check_path)
-check.save(check_path, params)
+options = orb.CheckpointManagerOptions(max_to_keep=3, save_interval_steps=10)
+ckptr = orb.CheckpointManager(
+    check_path, {
+        "params": orb.PyTreeCheckpointer(),
+        "state": orb.PyTreeCheckpointer()
+    },
+    options=options)
 
 tx = optax.adam(1e-3)
 
@@ -160,6 +168,7 @@ eps = 1e-15
 @jit
 def train_step(params, opt: optax.OptState, lam_0, lam_1, lam_2, lam_2d, data_3,
                data_2):
+  loss = 0
 
   def get_loss_f(feats, adj_sp):
     degr = jnp.diag(adj_sp @ jnp.ones((adj_sp.shape[-1], 1)))
@@ -174,72 +183,61 @@ def train_step(params, opt: optax.OptState, lam_0, lam_1, lam_2, lam_2d, data_3,
 
   def loss_fn(params, data_3, data_2):
     loss = 0
-    for fb3, fb2 in zip(data_3, data_2):
 
-      # # DIFFPOOL
-      # fl3, a, c, s = ge_3.apply({'params': params[0]}, fb3, adj3)
-      # fl2, _, _, _ = ge_2.apply({'params': params[1]}, fb2, adj2)
-      # f = gd.apply({'params': params[2]}, fl3, a, c, s)
-      # loss_ae = jnp.mean(jnp.square(f[:, 3:] - fb3[:, 3:]))
-      # loss_2 = jnp.mean(jnp.square(fl2 - fl3))
-      #
-      # loss_lp = jnp.mean(
-      #     jnp.array(
-      #         jtr.tree_map(
-      #             lambda a, s: jnp.sqrt(jnp.sum(jnp.square(a - s @ s.T))),
-      #             a[:-1], s)))
-      # loss_e = jnp.mean(
-      #     jnp.array(
-      #         jtr.tree_map(
-      #             lambda s: jnp.mean(jnp.sum(-s*jnp.exp(s + eps), axis=-1)),
-      #             s)))
-      # loss = loss + (loss_ae + lam_2*loss_2 + lam_dp*
-      #                (loss_e+loss_lp)) / batch_sz
+    # GSL POOL
+    fl3, a, as3, c, s3, fg3 = ge_3.apply({'params': params[0]}, data_3, adj_3)
+    fl2, _, as2, _, _, fg2 = ge_2.apply({'params': params[1]}, data_2, adj_2)
+    f = gd.apply({'params': params[2]}, fl3, a, c, s3)
+    loss_ae = jnp.mean(jnp.square(f[:, 3:] - data_3[:, 3:]))
+    loss_2d = jnp.mean(jnp.square(fl2 - fl3))
 
-      # # GSL POOL
-      fl3, a, as3, c, s3, fg3 = ge_3.apply({'params': params[0]}, fb3, adj_3)
-      fl2, _, as2, _, _, fg2 = ge_2.apply({'params': params[1]}, fb2, adj_2)
-      f = gd.apply({'params': params[2]}, fl3, a, c, s3)
-      loss_ae = jnp.mean(jnp.square(f[:, 3:] - fb3[:, 3:]))
-      loss_2d = jnp.mean(jnp.square(fl2 - fl3))
+    loss_f = jnp.mean(jnp.array(jtr.tree_map(get_loss_f, fg3, as3)))
+    loss_f = loss_f + jnp.mean(jnp.array(jtr.tree_map(get_loss_f, fg2, as2)))
 
-      loss_f = jnp.mean(jnp.array(jtr.tree_map(get_loss_f, fg3, as3)))
-      loss_f = loss_f + jnp.mean(jnp.array(jtr.tree_map(get_loss_f, fg2, as2)))
+    loss_p = jnp.mean(jnp.array(jtr.tree_map(get_loss_p, as3)))
+    loss_p = loss_p + jnp.mean(jnp.array(jtr.tree_map(get_loss_p, as2)))
+    loss = loss + (loss_ae + lam_2d*loss_2d + lam_0*loss_f +
+                    loss_p) / batch_sz
 
-      loss_p = jnp.mean(jnp.array(jtr.tree_map(get_loss_p, as3)))
-      loss_p = loss_p + jnp.mean(jnp.array(jtr.tree_map(get_loss_p, as2)))
-      loss = loss + (loss_ae + lam_2d*loss_2d + lam_0*loss_f +
-                     loss_p) / batch_sz
-
-      # NO POOLING:
-      # loss = loss + (loss_ae + lam_2*loss_2) / batch_sz
+    # # NO POOLING:
+    # loss = loss + (loss_ae + lam_2*loss_2) / batch_sz
     return loss
 
-  loss = 0
+  data_3_batched = vmap(
+      dsd, in_axes=(None, 0, None))(data_3, jnp.arange(batches)*batch_sz,
+                                    batch_sz)
+  data_2_batched = vmap(
+      dsd, in_axes=(None, 0, None))(data_2, jnp.arange(batches)*batch_sz,
+                                    batch_sz)
+                                    
   a_list = []
   c_list = []
   s_list = []
-  sample_loss = loss_fn(params, data_3, data_2)
-  grads = grad(loss_fn)(params, data_3, data_2)
-  # grads = grad(loss_fn)(params, features, adjacency)
-  updates, opt = tx.update(grads, opt, params)
-  params = optax.apply_updates(params, updates)
+  for (batch_3, batch_2) in zip(data_3_batched, data_2_batched):
+    sample_loss = vmap(loss_fn, in_axes=(None, 0, 0))(params, batch_3, batch_2)
+    batch_loss = jnp.mean(sample_loss, axis=0)
+    loss = loss + batch_loss/batches
 
-  # ensure covariances are always positive semi-definite
-  for i in range(len(params)):
-    p = fd.unfreeze(params[i])
-    for layer in params[i].keys():
-      if 'MoNetLayer' in layer:
-        tmp = p[layer]['sigma']
-        tmp = jnp.where(tmp > eps, tmp, eps)
-        p[layer]['sigma'] = tmp
-      else:
-        for sublayer in params[i][layer].keys():
-          if 'MoNetLayer' in sublayer:
-            tmp = p[layer][sublayer]['sigma']
-            tmp = jnp.where(tmp > eps, tmp, eps)
-            p[layer][sublayer]['sigma'] = tmp
-    params[i] = fd.freeze(p)
+    grads = vmap(grad(loss_fn), in_axes=(None, 0, 0))(params, batch_3, batch_2)
+    grads = jtr.tree_map(lambda g: jnp.mean(g, axis=0), grads)
+    updates, opt = tx.update(grads, opt, params)
+    params = optax.apply_updates(params, updates)
+
+    # ensure covariances are always positive semi-definite
+    for i in range(len(params)):
+      p = fd.unfreeze(params[i])
+      for layer in params[i].keys():
+        if 'MoNetLayer' in layer:
+          tmp = p[layer]['sigma']
+          tmp = jnp.where(tmp > eps, tmp, eps)
+          p[layer]['sigma'] = tmp
+        else:
+          for sublayer in params[i][layer].keys():
+            if 'MoNetLayer' in sublayer:
+              tmp = p[layer][sublayer]['sigma']
+              tmp = jnp.where(tmp > eps, tmp, eps)
+              p[layer][sublayer]['sigma'] = tmp
+      params[i] = fd.freeze(p)
 
   loss = loss + sample_loss/batch_sz
   for d3 in data_3:
@@ -249,21 +247,15 @@ def train_step(params, opt: optax.OptState, lam_0, lam_1, lam_2, lam_2d, data_3,
           jxs.BCSR((a_i.data / batch_sz, a_i.indices, a_i.indptr),
                    shape=a_i.shape) for a_i in a
       ]
-      c_list = jtr.tree_map(lambda c_i: c_i / batch_sz, c)
-      s_list = [
-          jxs.BCSR((s_i.data / batch_sz, s_i.indices, s_i.indptr),
-                   shape=s_i.shape) for s_i in s
-      ]
+      c_list = c
+      s_list = s
     else:
-      a_list = [
-          jxs.BCSR((a_i.data + a_new.data / batch_sz, a_i.indices, a_i.indptr),
-                   shape=a_i.shape) for a_i, a_new in zip(a_list, a)
+      a_list = [a_i +
+          jxs.BCSR((a_new.data / batch_sz, a_new.indices, a_new.indptr),
+                   shape=a_new.shape) for a_i, a_new in zip(a_list, a)
       ]
-      c_list = jtr.tree_map(lambda c_i, c_new: c_i + c_new/batch_sz, c_list, c)
-      s_list = [
-          jxs.BCSR((s_i.data + s_new.data / batch_sz, s_i.indices, s_i.indptr),
-                   shape=s_i.shape) for s_i, s_new in zip(s_list, s)
-      ]
+      c_list = jtr.tree_map(lambda c_i, c_new: jnp.unique(jnp.concatenate((c_i,c_new), axis=0),axis=0), c_list, c)
+      s_list = jtr.tree_map(lambda s_i, s_new: jnp.unique(jnp.concatenate((s_i,s_new), axis=None),axis=0), s_list, s)
 
   return loss, params, opt, a_list, c_list, s_list
 
@@ -301,21 +293,16 @@ def main(params, n_epochs):
             jxs.BCSR((a_i.data / batches, a_i.indices, a_i.indptr),
                      shape=a_i.shape) for a_i in a
         ]
-        c_list = jtr.tree_map(lambda c_i: c_i / batches, c)
-        s_list = [
-            jxs.BCSR((s_i.data / batches, s_i.indices, s_i.indptr),
-                     shape=s_i.shape) for s_i in s
-        ]
+        c_list = c
+        s_list = s
       else:
-        a_list = [
-            jxs.BCSR((a_i.data + a_new.data / batches, a_i.indices, a_i.indptr),
-                     shape=a_i.shape) for a_i, a_new in zip(a_list, a)
+        a_list = [a_i + 
+            jxs.BCSR((a_new.data / batches, a_new.indices, a_new.indptr),
+                     shape=a_new.shape) for a_i, a_new in zip(a_list, a)
         ]
-        c_list = jtr.tree_map(lambda c_i, c_new: c_i + c_new/batches, c_list, c)
-        s_list = [
-            jxs.BCSR((s_i.data + s_new.data / batches, s_i.indices, s_i.indptr),
-                     shape=s_i.shape) for s_i, s_new in zip(s_list, s)
-        ]
+        c_list = jtr.tree_map(lambda c_i, c_new: jnp.unique(jnp.concatenate((c_i,c_new), axis=0),axis=0), c_list, c)
+        s_list = jtr.tree_map(lambda s_i, s_new: jnp.unique(jnp.concatenate((s_i,s_new), axis=None),axis=0), s_list, s)
+
     test_err = 0
     for test in range(test_batches):
       data_3, data_2 = next(iter(test_dataloader))
@@ -342,5 +329,5 @@ def main(params, n_epochs):
 if __name__ == "__main__":
   if wandb_upload:
     import wandb
-    wandb.init(project="DB-GNN", entity="wglao", name="graph autoencoder")
+    wandb.init(project="DB-GNN", entity="wglao", name=case_name)
   main(params, n_epochs)

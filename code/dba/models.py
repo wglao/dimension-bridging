@@ -75,7 +75,7 @@ class MoNetLayer(nn.Module):
     mu = self.param('mu', nn.initializers.lecun_normal(), (self.r, 1))
     sig = self.param('sigma', self.sig_init, (self.r, 1))
     weights = jnp.squeeze(self.get_weights(mu, sig, monet_u))
-    out = self.aggregate(weights, adjacency, features[:, self.dim:])
+    out = self.aggregate(weights, adjacency, features)
     out = vmap(nn.Dense(self.channels))(out)
     out = jnp.column_stack((node_coords, out))
     return out
@@ -105,10 +105,11 @@ class DGSLNLayer(MoNetLayer):
         vmap(lambda w: nn.softmax(
             jnp.where(w > jnp.sort(w)[-self.k_sp], w, -jnp.inf)))(weights))
     adj_w = self.param("gsl_weights", self.sig_init, (2, 1))
+    w = jnp.abs(adj_w) / jnp.sum(jnp.abs(adj_w), axis=0)
     adj_new = jxs.BCSR(
-        (adj_sp.data / adj_w[0], adj_sp.indices, adj_sp.indptr),
+        (adj_sp.data*w[0], adj_sp.indices, adj_sp.indptr),
         shape=adj_sp.shape) + jxs.BCSR(
-            (adjacency.data / adj_w[1], adjacency.indices, adjacency.indptr),
+            (adjacency.data*w[1], adjacency.indices, adjacency.indptr),
             shape=adjacency.shape)
     return adj_new, adj_sp
 
@@ -136,6 +137,7 @@ class DiffPoolLayer(nn.Module):
     a = s.T @ adjacency @ s
     return s, f, a
 
+eps = 1e-15
 
 class GSLPoolLayer(nn.Module):
   pool_ratio: float = 0.8
@@ -147,8 +149,10 @@ class GSLPoolLayer(nn.Module):
   def __call__(self, features, adjacency: jxs.BCSR):
     n_keep = jnp.ceil(adjacency.shape[-1]*self.pool_ratio).astype(int)
     gnn_p = MoNetLayer(1, self.dim)
-    p = nn.softmax(gnn_p(features, adjacency)[:, self.dim:], axis=0)
-    s = jnp.argsort(p[jnp.nonzero(p)])[-n_keep:]
+    degree = adjacency @ jnp.ones((adjacency.shape[-1],1))
+    f_pool = jnp.column_stack((features[:,:self.dim], degree))
+    p = nn.softmax(gnn_p(f_pool, adjacency)[:, self.dim:], axis=0)
+    s = jnp.argsort(p[p > eps])[-n_keep:]
 
     adj_bcoo = adjacency.to_bcoo()
     del adjacency
@@ -226,7 +230,7 @@ class TransGSLLayer(nn.Module):
 
   @nn.compact
   def __call__(self, features, node_coords, adjacency, selection):
-    f = jnp.zeros((adjacency.shape[-1], features.shape[-1]))
+    f = jnp.zeros((adjacency.shape[0], features.shape[-1]))
     f = f.at[selection, self.dim:].set(features)
     f = f.at[:, :self.dim].set(node_coords)
     f = MoNetLayer(self.channels, self.dim)(f, adjacency)
@@ -273,6 +277,7 @@ class GraphEncoder(nn.Module):
 
 
 class GSLEncoder(GraphEncoder):
+  pool_ratio: float = 0.8
 
   @nn.compact
   def __call__(self, features, adjacency):
@@ -286,9 +291,8 @@ class GSLEncoder(GraphEncoder):
     f = self.act_no_coords(
         MoNetLayer(self.n_hidden_variables, self.dim)(features, a[-1]))
     for l in range(self.n_pools):
-      # ideally pf=2, pf>2 due to memory constraints
       selection, f, adj_co, adj_sp = GSLPoolLayer(
-          pool_ratio=0.8, dim=self.dim)(f, a[-1])
+          pool_ratio=self.pool_ratio, dim=self.dim)(f, a[-1])
       a.append(adj_co)
       a_sp.append(adj_sp)
       c.append(f[:, :self.dim])
@@ -383,6 +387,7 @@ class GSLDecoder(GraphDecoder):
 
     f = self.act_no_coords(
         MoNetLayer(self.n_final_variables, self.dim)(f, a_list[0]))
+    f = MoNetLayer(self.n_final_variables, self.dim)(f, a_list[0])
     return f
 
 
