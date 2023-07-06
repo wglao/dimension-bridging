@@ -147,7 +147,7 @@ class GSLPoolLayer(nn.Module):
   def __call__(self, features, adjacency: jxs.BCSR):
     n_keep = jnp.ceil(adjacency.shape[-1]*self.pool_ratio).astype(int)
     gnn_p = MoNetLayer(1, self.dim)
-    p = nn.softmax(gnn_p(features, adjacency)[:,self.dim:], axis=0)
+    p = nn.softmax(gnn_p(features, adjacency)[:, self.dim:], axis=0)
     s = jnp.argsort(p[jnp.nonzero(p)])[-n_keep:]
 
     adj_bcoo = adjacency.to_bcoo()
@@ -155,24 +155,27 @@ class GSLPoolLayer(nn.Module):
 
     adj_slc_0 = jxs.bcoo_concatenate(
         vmap(lambda i: jxs.bcoo_dynamic_slice(
-            adj_bcoo, start_indices=(i.astype(int), 0), slice_sizes=(1, adj_bcoo.shape[-1])
-        ))(s),
+            adj_bcoo,
+            start_indices=(i.astype(int), 0),
+            slice_sizes=(1, adj_bcoo.shape[-1])))(s),
         dimension=0)
     del adj_bcoo
-    
+
     adj_slc_1 = jxs.bcoo_concatenate(
         vmap(lambda i: jxs.bcoo_dynamic_slice(
-            adj_slc_0, start_indices=(0, i.astype(int)), slice_sizes=(adj_slc_0.shape[0], 1)
-        ))(s),
+            adj_slc_0,
+            start_indices=(0, i.astype(int)),
+            slice_sizes=(adj_slc_0.shape[0], 1)))(s),
         dimension=-1)
     del adj_slc_0
-    import pdb; pdb.set_trace()
+    import pdb
+    pdb.set_trace()
 
-    gnn_f = MoNetLayer(features.shape[-1]-self.dim,self.dim)
+    gnn_f = MoNetLayer(features.shape[-1] - self.dim, self.dim)
     f = gnn_f(features, adjacency)[s]
 
-    gsl = DGSLNLayer(dim=self.dim,k_sp=self.k_sp)
-    adj_new, adj_sp = gsl(f,adj_slc_1)
+    gsl = DGSLNLayer(dim=self.dim, k_sp=self.k_sp)
+    adj_new, adj_sp = gsl(f, adj_slc_1)
     return s, f, adj_new, adj_sp
 
 
@@ -223,11 +226,12 @@ class TransGSLLayer(nn.Module):
 
   @nn.compact
   def __call__(self, features, node_coords, adjacency, selection):
-    f = jnp.zeros((adjacency.shape[-1],features.shape[-1]))
-    f = f.at[selection,self.dim:].set(features)
-    f = f.at[:,:self.dim].set(node_coords)
-    f = MoNetLayer(self.channels,self.dim)(f,adjacency)
+    f = jnp.zeros((adjacency.shape[-1], features.shape[-1]))
+    f = f.at[selection, self.dim:].set(features)
+    f = f.at[:, :self.dim].set(node_coords)
+    f = MoNetLayer(self.channels, self.dim)(f, adjacency)
     return f
+
 
 class GraphEncoder(nn.Module):
   n_pools: int = 1
@@ -293,10 +297,11 @@ class GSLEncoder(GraphEncoder):
 
       f = self.act_no_coords(
           MoNetLayer(self.n_hidden_variables, self.dim)(f, a[-1]))
-    
+
     f_latent = self.act(nn.Dense(self.n_hidden_variables)(f.ravel()))
     f_latent = nn.Dense(self.n_latent_variables)(f_latent)
     return f_latent, a, a_sp, c, s, f_gsl
+
 
 class GraphEncoderNoPooling(GraphEncoder):
 
@@ -314,7 +319,10 @@ class GraphEncoderNoPooling(GraphEncoder):
 
     f_latent = self.act(nn.Dense(self.n_hidden_variables)(f.ravel()))
     f_latent = nn.Dense(self.n_latent_variables)(f_latent)
-    return f_latent, a, c, [jxs.eye(1, sparse_format='csr')]
+    return f_latent, a, c, [
+        jxs.BCSR((jnp.ones((1,)), jnp.zeros((1,), jnp.int32), jnp.arange(2)),
+                 shape=(1, 1))
+    ]
 
 
 class GraphDecoder(nn.Module):
@@ -337,10 +345,9 @@ class GraphDecoder(nn.Module):
     f = jnp.reshape(f, (n_nodes, len(f) // n_nodes))
     f = jnp.column_stack((c_list[-1], f))
 
-
     f = self.act_no_coords(
         MoNetLayer(self.n_final_variables, self.dim)(f, a_list[0]))
-    
+
     for l in range(self.n_upsamples):
       f = self.act_no_coords(
           MoNetLayer(self.n_hidden_variables, self.dim)(f, a_list[-l - 1]))

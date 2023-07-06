@@ -156,6 +156,7 @@ eps = 1e-15
 #   return a, c, s
 
 
+
 @jit
 def train_step(params, opt: optax.OptState, lam_2, lam_dp, data_3, data_2):
   loss = 0
@@ -219,46 +220,10 @@ def train_step(params, opt: optax.OptState, lam_2, lam_dp, data_3, data_2):
             p[layer][sublayer]['sigma'] = tmp
     params[i] = fd.freeze(p)
 
-  def get_acs(params, data_3):
-    a_list = []
-    c_list = []
-    s_list = []
-    for d3 in data_3:
-      _, a, c, s = ge_3.apply({'params': params[0]}, d3, adj_3)
-      if a_list == []:
-        a_list = [
-            jxs.BCSR.from_bcoo(
-                jxs.BCOO((a_i.data / batch_sz, a_i.indices), shape=a_i.shape))
-            for a_i in [a_j.to_bcoo().sum_duplicates() for a_j in a]
-        ]
-        c_list = jtr.tree_map(lambda c_i: c_i / batch_sz, c)
-        s_list = [
-            jxs.BCSR.from_bcoo(
-                jxs.BCOO((s_i.data / batch_sz, s_i.indices), shape=s_i.shape))
-            for s_i in [s_j.to_bcoo().sum_duplicates() for s_j in s]
-        ]
-      else:
-        a_list = [
-            jxs.BCSR.from_bcoo(
-                jxs.BCOO(
-                    (a_i.data + a_new.data / batch_sz, a_i.indices),
-                    shape=a_i.shape)) for a_i, a_new in zip(
-                        a_list, [a_j.to_bcoo().sum_duplicates() for a_j in a])
-        ]
-        c_list = jtr.tree_map(lambda c_i, c_new: c_i + c_new/batch_sz, c_list,
-                              c)
-        s_list = [
-            jxs.BCSR.from_bcoo(
-                jxs.BCOO(
-                    (s_i.data + s_new.data / batch_sz, s_i.indices),
-                    shape=s_i.shape)) for s_i, s_new in zip(
-                        s_list, [s_j.to_bcoo().sum_duplicates() for s_j in s])
-        ]
-    return a_list, c_list, s_list
+  
+  _, a, c, s = ge_3.apply({'params': params[0]}, data_3, adj_3)
 
-  a_list, c_list, s_list = get_acs(params, data_3)
-
-  return loss, params, opt, a_list, c_list, s_list
+  return loss, params, opt, a, c, s
 
 
 @jit
@@ -321,6 +286,9 @@ def main(params, n_epochs):
             jxs.BCSR((s_i.data + s_new.data / batches, s_i.indices, s_i.indptr),
                      shape=s_i.shape) for s_i, s_new in zip(s_list, s)
         ]
+      
+      a_list = [a.sum_duplicates() for a in a_list]
+      s_list = [s.sum_duplicates() for s in s_list]
     if not wandb_upload:
       print("Test")
     test_err = test_step(params, a, c, s, test_data_3, test_data_2)
