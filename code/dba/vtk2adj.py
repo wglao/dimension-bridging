@@ -29,25 +29,18 @@ def v2a(mesh):
 
   data = jnp.ones((indices.shape[0],))
 
-  adjacency = jxs.BCSR.from_bcoo(
-      jxs.BCOO((data, indices), shape=(n_nodes, n_nodes)))
+  adjacency = jxs.BCOO((data, indices), shape=(n_nodes, n_nodes))
   return adjacency.sum_duplicates()
 
 
 def combineAdjacency(adjs):
   in_szs = jnp.array([a.shape[0] for a in adjs])
-  in_nse = jnp.array([a.nse for a in adjs])
   out_sz = int(jnp.sum(in_szs))
   buffer = jnp.concatenate((jnp.array([0]), jnp.cumsum(in_szs)[:-1]), axis=None)
-  buff_ptr = jnp.concatenate((jnp.array([0]), jnp.cumsum(in_nse)[:-1]+1),
-                             axis=None)
   indices = jnp.concatenate([a.indices + b for a, b in zip(adjs, buffer)],
                             axis=0)
-  indptr = jnp.concatenate([a.indptr[:-1] + b for a, b in zip(adjs, buff_ptr)],
-                           axis=0)
-  indptr = jnp.concatenate((indptr, jnp.array([jnp.sum(in_nse)])), axis=None)
   data = jnp.concatenate([a.data for a in adjs], axis=None)
-  adjacency = jxs.BCSR((data, indices, indptr),
+  adjacency = jxs.BCOO((data, indices),
                        shape=(int(out_sz), int(out_sz)))
   return adjacency.sum_duplicates()
 

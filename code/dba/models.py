@@ -1,12 +1,17 @@
 from typing import Any
+from functools import partial
 
 import flax.linen as nn
+import jax.experimental.sparse as jxs
 import jax.image as jim
 import jax.numpy as jnp
 from jax import jit, vmap
 from jax.lax import scan
 from jax.lax import dynamic_update_slice as duds
-import jax.experimental.sparse as jxs
+from jax.lax import dynamic_slice_in_dim as dsd
+from jax.lax import reduce_window as rdw
+
+eps = 1e-15
 
 
 class MitsuMatsuCNN(nn.Module):
@@ -40,7 +45,7 @@ class MoNetLayer(nn.Module):
   channels: int = 32
   dim: int = 3
   r: int = 3
-  act: callable = nn.tanh
+  act: callable = nn.relu
 
   def _get_weight_i(self, mu, sig, u_j):
     return jnp.exp(-0.5*
@@ -53,30 +58,33 @@ class MoNetLayer(nn.Module):
     return jnp.squeeze(jnp.abs(nn.initializers.lecun_normal()(rng, shape)))
 
   def aggregate(self, weights, adjacency, features):
-    attention = jxs.BCSR(
-        (adjacency.data*weights, adjacency.indices, adjacency.indptr),
-        shape=adjacency.shape)
+    attention = jxs.BCOO((adjacency.data*weights, adjacency.indices),
+                         shape=adjacency.shape)
     out = attention @ features
     return out
 
   @nn.compact
-  def __call__(self, features, adjacency: jxs.BCSR):
+  def __call__(self, features, adjacency: jxs.BCOO):
     n_nodes = adjacency.shape[-1]
     # take first `dim` elements to be the node coordinates
     node_coords = features[:, :self.dim]
-    # assume node coords are 3d
-    xi_ind = adjacency.to_bcoo().indices[:, 0]
-    monet_xi = node_coords[xi_ind]
-    monet_xj = node_coords[adjacency.indices]
+    monet_xi = node_coords[adjacency.indices[:, 0]]
+    monet_xj = node_coords[adjacency.indices[:, 1]]
     monet_u = monet_xj - monet_xi
     # learned coordinates from monet paper
     monet_u = jnp.expand_dims(self.act(nn.Dense(self.r)(monet_u)), axis=-1)
 
-    mu = self.param('mu', nn.initializers.lecun_normal(), (self.r, 1))
-    sig = self.param('sigma', self.sig_init, (self.r, 1))
-    weights = jnp.squeeze(self.get_weights(mu, sig, monet_u))
-    out = self.aggregate(weights, adjacency, features)
-    out = vmap(nn.Dense(self.channels))(out)
+    mu = self.param('mu', nn.initializers.lecun_normal(),
+                    (self.channels, self.r, 1))
+    sig = self.param('sigma', self.sig_init, (self.channels, self.r, 1))
+    weights = jnp.squeeze(
+        vmap(self.get_weights, in_axes=(0, 0, None))(mu, sig, monet_u))
+    
+    out = jnp.array([self.aggregate(weight, adjacency, features) for weight in weights])
+        
+    # out = vmap(nn.Dense(self.channels))(out)
+    out = jnp.sum(out, axis=-1)
+    out = jnp.moveaxis(out, 0, -1)
     out = jnp.column_stack((node_coords, out))
     return out
 
@@ -85,32 +93,38 @@ class DGSLNLayer(MoNetLayer):
   k_sp: int = 3
 
   @nn.compact
-  def __call__(self, features, adjacency: jxs.BCSR):
+  def __call__(self, features, adjacency: jxs.BCOO):
     n_nodes = adjacency.shape[-1]
     # take first `dim` elements to be the node coordinates
     node_coords = features[:, :self.dim]
-    # assume node coords are 3d
-    xi_ind = adjacency.to_bcoo().indices[:, 0]
-    monet_xi = node_coords[xi_ind]
-    monet_xj = node_coords[adjacency.indices]
-    monet_u = monet_xj - monet_xi
-    # learned coordinates from monet paper
-    monet_u = jnp.expand_dims(self.act(nn.Dense(self.r)(monet_u)), axis=-1)
-    mu = self.param('mu', nn.initializers.lecun_normal(), (self.r, 1))
-    sig = self.param('sigma', self.sig_init, (self.r, 1))
-    weights = jnp.squeeze(self.get_weights(mu, sig, monet_u))
 
-    # sparsification
-    adj_sp = jxs.BCSR.fromdense(
-        vmap(lambda w: nn.softmax(
-            jnp.where(w > jnp.sort(w)[-self.k_sp], w, -jnp.inf)))(weights))
+    mu_m = self.param('mu_mask', nn.initializers.lecun_normal(), (self.r, 1))
+    sig_m = self.param('sigma_mask', self.sig_init, (self.r, 1))
+
+    adj_sp_data_list = []
+    adj_sp_ind_list = []
+
+    rows = jnp.arange(n_nodes)
+    for row in rows:
+      monet_u = node_coords - node_coords[row]
+      monet_u = jnp.expand_dims(self.act(nn.Dense(self.r)(monet_u)), axis=-1)
+      weights = jnp.squeeze(self.get_weights(mu_m, sig_m, monet_u))
+      adj_sp_data = nn.softmax(
+          jnp.where(weights >= jnp.sort(weights)[-self.k_sp], weights,
+                    -jnp.inf),
+          axis=0)
+      adj_sp_ind_list.append(
+          jnp.column_stack((row*jnp.ones((node_coords.shape[0],)), rows)))
+      adj_sp_data_list.append(adj_sp_data)
+
+    adj_sp_data = jnp.concatenate(
+        [jnp.array(data) for data in adj_sp_data_list], axis=None)
+    adj_sp_ind = jnp.concatenate(
+        [jnp.array(ind).astype(int) for ind in adj_sp_ind_list], axis=0)
+    adj_sp = jxs.BCOO((adj_sp_data, adj_sp_ind), shape=adjacency.shape)
     adj_w = self.param("gsl_weights", self.sig_init, (2, 1))
-    w = jnp.abs(adj_w) / jnp.sum(jnp.abs(adj_w), axis=0)
-    adj_new = jxs.BCSR(
-        (adj_sp.data*w[0], adj_sp.indices, adj_sp.indptr),
-        shape=adj_sp.shape) + jxs.BCSR(
-            (adjacency.data*w[1], adjacency.indices, adjacency.indptr),
-            shape=adjacency.shape)
+    adj_new = adj_w[0]*adj_sp + adj_w[1]*adjacency
+
     return adj_new, adj_sp
 
 
@@ -120,14 +134,14 @@ class DiffPoolLayer(nn.Module):
   act: callable = nn.softmax
 
   @nn.compact
-  def __call__(self, features, adjacency: jxs.BCSR):
+  def __call__(self, features, adjacency: jxs.BCOO):
     # take ceil of n/pf**dim
     n_clusters = int(-(adjacency.shape[-1] // -(self.pool_factor**self.dim)))
 
     gnn_s = MoNetLayer(n_clusters, self.dim)
 
     s = gnn_s(features, adjacency)
-    s = jxs.BCSR.fromdense(self.act(s[:, self.dim:], axis=-1))
+    s = jxs.BCOO.fromdense(self.act(s[:, self.dim:], axis=-1))
     # s = (s.T[~jnp.all(s.T == 0, axis=-1)]).T
 
     f = s.T @ features
@@ -137,49 +151,54 @@ class DiffPoolLayer(nn.Module):
     a = s.T @ adjacency @ s
     return s, f, a
 
-eps = 1e-15
 
 class GSLPoolLayer(nn.Module):
-  pool_ratio: float = 0.8
   dim: int = 3
   k_sp: int = 3
-  act: callable = nn.elu
+  act: callable = nn.relu
 
   @nn.compact
-  def __call__(self, features, adjacency: jxs.BCSR):
-    n_keep = jnp.ceil(adjacency.shape[-1]*self.pool_ratio).astype(int)
+  def __call__(self, features, adjacency: jxs.BCOO, pool_ratio):
+    n_keep = int(-(adjacency.shape[-1] // (-1 / pool_ratio)))
     gnn_p = MoNetLayer(1, self.dim)
-    degree = adjacency @ jnp.ones((adjacency.shape[-1],1))
-    f_pool = jnp.column_stack((features[:,:self.dim], degree))
-    p = nn.softmax(gnn_p(f_pool, adjacency)[:, self.dim:], axis=0)
-    s = jnp.argsort(p[p > eps])[-n_keep:]
+    # degree = adjacency @ jnp.ones((adjacency.shape[-1], 1))
+    # f_pool = jnp.column_stack((features[:, :self.dim], degree))
+    # p = nn.softmax(gnn_p(f_pool, adjacency)[:, self.dim:], axis=0)
+    p = jnp.squeeze(
+        jnp.argsort(
+            nn.softmax(gnn_p(features, adjacency)[:, self.dim:], axis=0),
+            axis=0))
+    # s = jnp.argsort(p[p > eps], axis=0)[-n_keep:]
+    # s = jnp.squeeze(jnp.sort(jnp.argsort(p, axis=0)[-self.n_keep:], axis=0))
+    s = jnp.sort(dsd(p, -n_keep, n_keep), axis=0)
+    f = features[s]
 
-    adj_bcoo = adjacency.to_bcoo()
-    del adjacency
+    s_idx = jnp.column_stack((s, jnp.arange(n_keep)))
+    s_idx_T = jnp.column_stack((jnp.arange(n_keep), s))
+    s_dat = jnp.ones((n_keep,))
+    s_mat = jxs.BCOO((s_dat, s_idx), shape=(adjacency.shape[-1], n_keep))
+    s_mat_T = jxs.BCOO((s_dat, s_idx_T), shape=(n_keep, adjacency.shape[-1]))
 
-    adj_slc_0 = jxs.bcoo_concatenate(
-        vmap(lambda i: jxs.bcoo_dynamic_slice(
-            adj_bcoo,
-            start_indices=(i.astype(int), 0),
-            slice_sizes=(1, adj_bcoo.shape[-1])))(s),
-        dimension=0)
-    del adj_bcoo
-
-    adj_slc_1 = jxs.bcoo_concatenate(
-        vmap(lambda i: jxs.bcoo_dynamic_slice(
-            adj_slc_0,
-            start_indices=(0, i.astype(int)),
-            slice_sizes=(adj_slc_0.shape[0], 1)))(s),
-        dimension=-1)
-    del adj_slc_0
     import pdb
     pdb.set_trace()
 
-    gnn_f = MoNetLayer(features.shape[-1] - self.dim, self.dim)
-    f = gnn_f(features, adjacency)[s]
+    adj_id = (s_mat_T @ (adjacency @ s_mat).sum_duplicates(nse=s_mat.nse)
+             ).sum_duplicates(nse=s_mat.nse)
 
+    # adj_id = adjacency[s][:,s].sum_duplicates()
+
+    # new_idx = adjacency.indices[jnp.in1d(adjacency.indices[:, 0], s)
+    #                             & jnp.in1d(adjacency.indices[:, 1], s)]
+    # for i, s_i in enumerate(s):
+    #   tmp = new_idx.ravel()
+    #   new_idx = jnp.reshape(tmp.at[tmp == s_i].set(i), new_idx.shape)
+
+    # new_data = adjacency.data[jnp.in1d(adjacency.indices[:, 0], s)
+    #                           & jnp.in1d(adjacency.indices[:, 1], s)]
+
+    # adj_id = jxs.BCOO((new_data, new_idx), shape=(n_keep, n_keep))
     gsl = DGSLNLayer(dim=self.dim, k_sp=self.k_sp)
-    adj_new, adj_sp = gsl(f, adj_slc_1)
+    adj_new, adj_sp = gsl(f, adj_id)
     return s, f, adj_new, adj_sp
 
 
@@ -192,7 +211,6 @@ class TransAggLayer(nn.Module):
     # build new graph combining parent and children nodes
     # by appending selection (clustering) adjacency
     # to true graph adjacency
-    #TODO: switch a to bcsr
     p_nodes = selection.shape[-1]
     c_nodes = adjacency.shape[-1]
     x_ind = vmap(lambda i: c_nodes + i)(jnp.arange(1, p_nodes + 1))
@@ -231,8 +249,8 @@ class TransGSLLayer(nn.Module):
   @nn.compact
   def __call__(self, features, node_coords, adjacency, selection):
     f = jnp.zeros((adjacency.shape[0], features.shape[-1]))
-    f = f.at[selection, self.dim:].set(features)
     f = f.at[:, :self.dim].set(node_coords)
+    f = f.at[selection].set(features)
     f = MoNetLayer(self.channels, self.dim)(f, adjacency)
     return f
 
@@ -242,11 +260,11 @@ class GraphEncoder(nn.Module):
   n_latent_variables: int = 50
   n_hidden_variables: int = 200
   dim: int = 3
-  act: callable = nn.elu
+  act: callable = nn.relu
 
-  def act_no_coords(self, features):
-    out = features.at[:, self.dim:].set(self.act(features[:, self.dim:]))
-    return out
+  def act_no_coords(self, f):
+    f = f.at[:, self.dim:].set(self.act(f[:, self.dim:]))
+    return f
 
   @nn.compact
   def __call__(self, features, adjacency):
@@ -277,10 +295,9 @@ class GraphEncoder(nn.Module):
 
 
 class GSLEncoder(GraphEncoder):
-  pool_ratio: float = 0.8
 
   @nn.compact
-  def __call__(self, features, adjacency):
+  def __call__(self, features, adjacency, pool_ratio):
     a = []
     a_sp = []
     c = []
@@ -291,8 +308,8 @@ class GSLEncoder(GraphEncoder):
     f = self.act_no_coords(
         MoNetLayer(self.n_hidden_variables, self.dim)(features, a[-1]))
     for l in range(self.n_pools):
-      selection, f, adj_co, adj_sp = GSLPoolLayer(
-          pool_ratio=self.pool_ratio, dim=self.dim)(f, a[-1])
+      selection, f, adj_co, adj_sp = GSLPoolLayer(dim=self.dim)(f, a[-1],
+                                                                pool_ratio)
       a.append(adj_co)
       a_sp.append(adj_sp)
       c.append(f[:, :self.dim])
@@ -324,8 +341,7 @@ class GraphEncoderNoPooling(GraphEncoder):
     f_latent = self.act(nn.Dense(self.n_hidden_variables)(f.ravel()))
     f_latent = nn.Dense(self.n_latent_variables)(f_latent)
     return f_latent, a, c, [
-        jxs.BCSR((jnp.ones((1,)), jnp.zeros((1,), jnp.int32), jnp.arange(2)),
-                 shape=(1, 1))
+        jxs.BCOO((jnp.ones((1,)), jnp.ones((1, 2), jnp.int32)), shape=(1, 1))
     ]
 
 
@@ -334,7 +350,7 @@ class GraphDecoder(nn.Module):
   n_final_variables: int = 1
   n_hidden_variables: int = 200
   dim: int = 3
-  act: callable = nn.elu
+  act: callable = nn.relu
 
   def act_no_coords(self, features):
     out = features.at[:, self.dim:].set(self.act(features[:, self.dim:]))
@@ -415,7 +431,7 @@ class GraphAutoEncoder(nn.Module):
   n_latent_variables: int = 32
   n_hidden_variables: int = 64
   dim: int = 3
-  act: callable = nn.elu
+  act: callable = nn.relu
 
   def act_no_coords(self, features):
     out = features.at[:, self.dim:].set(self.act(features[:, self.dim:]))

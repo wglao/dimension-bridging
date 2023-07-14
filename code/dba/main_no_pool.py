@@ -10,7 +10,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument(
     "--case-name", default="dba", type=str, help="Architecture Name")
 parser.add_argument(
-    "--channels", default=50, type=int, help="Aggregation Channels")
+    "--channels", default=10, type=int, help="Aggregation Channels")
 parser.add_argument(
     "--latent-sz", default=50, type=int, help="Latent Space Dimensionality")
 parser.add_argument(
@@ -48,27 +48,30 @@ from models import GraphEncoder, GraphDecoder, GraphEncoderNoPooling, GraphDecod
 from graphdata import GraphDataset, GraphLoader
 from vtk2adj import v2a, combineAdjacency
 
+if not wandb_upload:
+  print('Load')
+
 # loop through folders and load data
 # ma_list = [0.2, 0.35, 0.5, 0.65, 0.8]
-ma_list = [0.2, 0.35]
-# ma_list = [0.5]
+ma_list = [0.2, 0.35, 0.5] if wandb_upload else [0.2]
+# ma_list = [0.2]
 # re_list = [1e6, 2e6, 5e6, 1e7, 2e7]
-re_list = [1e6, 1e7]
-# re_list = [1e5]
+re_list = [1e6, 2e6, 1e7, 2e7] if wandb_upload else [2e6]
+# re_list = [1e6]
 # aoa_list = [0, 3, 6, 9, 12]
-aoa_list = [3, 6, 9]
-# aoa_list = [0]
+aoa_list = [3, 6, 9, 12] if wandb_upload else [3, 6]
+# aoa_list = [3]
 n_slices = 5
 data_path = os.path.join(os.environ["SCRATCH"], "ORNL/dimension-bridging/data")
 
 train_dataset = GraphDataset(data_path, ma_list, re_list, aoa_list, n_slices)
-test_dataset = GraphDataset(data_path, [0.5], re_list, aoa_list, n_slices)
+test_dataset = GraphDataset(data_path, ma_list, [5e6], aoa_list, n_slices)
 
 n_samples = len(ma_list)*len(re_list)*len(aoa_list)
-batch_sz = 8
+batch_sz = jnp.min(jnp.array([10, n_samples])).astype(int)
 batches = -(n_samples // -batch_sz)
-n_test = 1*len(re_list)*len(aoa_list)
-test_sz = 8
+n_test = len(ma_list)*1*len(aoa_list)
+test_sz = jnp.min(jnp.array([10, n_test])).astype(int)
 test_batches = -(n_test // -test_sz)
 
 train_dataloader = GraphLoader(train_dataset, n_samples, shuffle=True)
@@ -99,6 +102,9 @@ test_data_3, test_data_2 = next(iter(test_dataloader))
 init_data_3 = test_data_3[0]
 init_data_2 = test_data_2[0]
 
+if not wandb_upload:
+  print('Init')
+
 # ge_3 = GraphEncoder(n_pools, args.latent_sz, args.channels, dim=3)
 # ge_2 = GraphEncoder(n_pools, args.latent_sz, args.channels, dim=2)
 ge_3 = GraphEncoderNoPooling(n_pools, args.latent_sz, args.channels, dim=3)
@@ -118,7 +124,7 @@ check_path = os.path.join(data_path, "models_save", case_name,
                           today.strftime("%d%m%y"))
 if os.path.exists(check_path):
   shutil.rmtree(check_path)
-options = orb.CheckpointManagerOptions(max_to_keep=3, save_interval_steps=10)
+options = orb.CheckpointManagerOptions(max_to_keep=3, save_interval_steps=1)
 ckptr = orb.CheckpointManager(
     check_path, {
         "params": orb.PyTreeCheckpointer(),
@@ -130,7 +136,7 @@ ckptr = orb.CheckpointManager(
 
 tx = optax.adam(1e-3)
 
-n_epochs = 10000
+n_epochs = 50000
 
 eps = 1e-15
 
@@ -163,7 +169,14 @@ def train_step(params, opt: optax.OptState, lam_2, lam_dp, data_3, data_2):
     loss = 0
     fl3, a, c, s = ge_3.apply({'params': params[0]}, data_3, adj_3)
     fl2, _, _, _ = ge_2.apply({'params': params[1]}, data_2, adj_2)
-    f = gd.apply({'params': params[2]}, fl3, a, c, s)
+
+    # # 3->3 isprimary ae loss
+    # f = gd.apply({'params': params[2]}, fl3, a, c, s)
+    # loss_ae = jnp.mean(jnp.square(f[:, 3:] - data_3[:, 3:]))
+    # loss_2 = jnp.mean(jnp.square(fl2 - fl3))
+
+    # 2->3 isprimary ae loss
+    f = gd.apply({'params': params[2]}, fl2, a, c, s)
     loss_ae = jnp.mean(jnp.square(f[:, 3:] - data_3[:, 3:]))
     loss_2 = jnp.mean(jnp.square(fl2 - fl3))
 
@@ -225,18 +238,28 @@ def train_step(params, opt: optax.OptState, lam_2, lam_dp, data_3, data_2):
 
 @jit
 def test_step(params, adj_list, coordinates, selection, data_3, data_2):
-  # @jit
-  def loss_fn(params, data_3, data_2, adj_list, coordinates, selection):
+  test_err = 0
+
+  def loss_fn(params, adj_list, coordinates, selection, data_3, data_2):
     fl2, _, _, _ = ge_2.apply({'params': params[1]}, data_2, adj_2)
     f = gd.apply({'params': params[2]}, fl2, adj_list, coordinates, selection)
     loss_ae = jnp.mean(jnp.square(f[:, 3:] - data_3[:, 3:]))
     return loss_ae
 
-  test_err = vmap(
-      loss_fn,
-      in_axes=(None, 0, 0, None, None, None))(params, data_3, data_2, adj_list,
-                                              coordinates, selection)
-  test_err = jnp.mean(test_err, axis=0)
+  data_3_batched = vmap(
+      dsd, in_axes=(None, 0, None))(data_3, jnp.arange(test_batches)*test_sz,
+                                    test_sz)
+  data_2_batched = vmap(
+      dsd, in_axes=(None, 0, None))(data_2, jnp.arange(test_batches)*test_sz,
+                                    test_sz)
+
+  for (batch_3, batch_2) in zip(data_3_batched, data_2_batched):
+    sample_loss = vmap(
+        loss_fn,
+        in_axes=(None, None, None, None, 0, 0))(params, adj_list, coordinates,
+                                                selection, batch_3, batch_2)
+    batch_loss = jnp.mean(sample_loss, axis=0)
+    test_err = test_err + batch_loss/test_batches
   return test_err
 
 
@@ -253,43 +276,20 @@ def test_step(params, adj_list, coordinates, selection, data_3, data_2):
 def main(params, n_epochs):
   opt = tx.init(params)
   # indices = train_dataset.items
+  min_err = jnp.inf
   for epoch in range(n_epochs):
-    a_list = []
-    c_list = []
-    s_list = []
     if not wandb_upload:
       print("Train")
-    for batch in range(batches):
-      loss, params, opt, a, c, s = train_step(params, opt, args.lambda_2d,
-                                              args.lambda_dp, train_data_3,
-                                              train_data_2)
-      if a_list == []:
-        a_list = [
-            jxs.BCSR((a_i.data / batches, a_i.indices, a_i.indptr),
-                     shape=a_i.shape) for a_i in a
-        ]
-        c_list = jtr.tree_map(lambda c_i: c_i / batches, c)
-        s_list = [
-            jxs.BCSR((s_i.data / batches, s_i.indices, s_i.indptr),
-                     shape=s_i.shape) for s_i in s
-        ]
-      else:
-        a_list = [
-            jxs.BCSR((a_i.data + a_new.data / batches, a_i.indices, a_i.indptr),
-                     shape=a_i.shape) for a_i, a_new in zip(a_list, a)
-        ]
-        c_list = jtr.tree_map(lambda c_i, c_new: c_i + c_new/batches, c_list, c)
-        s_list = [
-            jxs.BCSR((s_i.data + s_new.data / batches, s_i.indices, s_i.indptr),
-                     shape=s_i.shape) for s_i, s_new in zip(s_list, s)
-        ]
+    loss, params, opt, a, c, s = train_step(params, opt, args.lambda_2d,
+                                            args.lambda_dp, train_data_3,
+                                            train_data_2)
 
-      a_list = [a.sum_duplicates() for a in a_list]
-      s_list = [s.sum_duplicates() for s in s_list]
+    a = [a.sum_duplicates() for a in a]
+    s = [s.sum_duplicates() for s in s]
     if not wandb_upload:
       print("Test")
     test_err = test_step(params, a, c, s, test_data_3, test_data_2)
-    if epoch % 10 == 0 or epoch == n_epochs - 1:
+    if epoch % 100 == 0 or epoch == n_epochs - 1:
       if wandb_upload:
         wandb.log({
             "Loss": loss,
@@ -299,13 +299,15 @@ def main(params, n_epochs):
       else:
         print("Loss: {:g}, Error {:g}, Epoch {:g}".format(
             loss, test_err, epoch))
-    ckptr.save(epoch, {
-        "params": params,
-        "state": {
-            "Loss": loss,
-            "Error": test_err
-        }
-    })
+      if test_err < min_err or epoch == n_epochs - 1:
+        min_err = test_err
+        ckptr.save(epoch, {
+            "params": params,
+            "state": {
+                "Loss": loss,
+                "Error": test_err
+            }
+        })
 
 
 if __name__ == "__main__":
