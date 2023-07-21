@@ -47,9 +47,8 @@ import pyvista as pv
 from torch.utils.data import DataLoader
 import orbax.checkpoint as orb
 
-from models import GraphEncoder, GraphDecoder, GSLEncoder, GSLDecoder, GraphEncoderNoPooling, GraphDecoderNoPooling
+from models import DBA
 from graphdata import GraphDataset, GraphLoader
-from vtk2adj import v2a, combineAdjacency
 
 if not wandb_upload:
   print('Load')
@@ -127,21 +126,7 @@ pool_ratio = 0.01
 if not wandb_upload:
   print('Init')
 
-# ge_3 = GraphEncoder(n_pools, args.latent_sz, args.channels, dim=3)
-# ge_2 = GraphEncoder(n_pools, args.latent_sz, args.channels, dim=3)
-
-ge_3 = GSLEncoder(n_pools, args.latent_sz, args.channels, dim=3)
-ge_2 = GSLEncoder(n_pools, args.latent_sz, args.channels, dim=3)
-
-# ge_3 = GraphEncoderNoPooling(n_pools, args.latent_sz, args.channels, dim=3)
-# ge_2 = GraphEncoderNoPooling(
-#     n_pools, args.latent_sz, args.channels, dim=3)
-
-final_sz = init_data_3.shape[-1] - 3
-
-# gd = GraphDecoder(n_pools, final_sz, args.channels, dim=3)
-gd = GSLDecoder(n_pools, final_sz, args.channels, dim=3)
-# gd = GraphDecoderNoPooling(n_pools, final_sz, args.channels, dim=3)
+model = DBA(3, )
 
 pe_3 = ge_3.init(rng, deg_f, adj_3, pool_ratio)['params']
 pe_2 = ge_2.init(rng, init_data_2, adj_2, pool_ratio)['params']
@@ -167,25 +152,14 @@ n_epochs = 10000
 
 eps = 1e-15
 
-# @jit
-# def get_acs(params, features_3, adjacency_3):
-#   a_list = []
-#   c_list = []
-#   s_list = []
-#   for fb3 in jnp.concatenate(features_3):
-#     _, a, c, s = ge_3.apply({'params': params[0]}, fb3, adjacency_3)
-#     if a_list == []:
-#       a_list = jtr.tree_map(lambda a: a / batches / batch_sz, a)
-#       c_list = jtr.tree_map(lambda c: c / batches / batch_sz, c)
-#       s_list = jtr.tree_map(lambda s: s / batches / batch_sz, s)
-#     else:
-#       a_list = jtr.tree_map(lambda a, a_new: a + a_new/batches/batch_sz,
-#                             a_list, a)
-#       c_list = jtr.tree_map(lambda c, c_new: c + c_new/batches/batch_sz,
-#                             c_list, c)
-#       s_list = jtr.tree_map(lambda s, s_new: s + s_new/batches/batch_sz,
-#                             s_list, s)
-#   return a, c, s
+
+# set kernel size to mean of node degree vector
+idx = init_data.coo()
+sz = init_data.num_nodes
+adj = torch.sparse_coo_tensor(idx, np.ones((init_data.num_edges,)),
+                              (sz, sz))
+deg = adj.matmul(torch.tensor(np.ones((sz, 1))))
+
 
 
 @partial(jit, static_argnums=(8))

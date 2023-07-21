@@ -5,7 +5,7 @@ from typing import Tuple, Union, Optional, Callable
 from torch import nn
 from torch_geometric.data import Batch, Data
 from torch_geometric.loader import ClusterData, ClusterLoader
-from torch_geometric.nn import SAGEConv, SAGPooling, GraphConv, knn_interpolate
+from torch_geometric.nn import SAGEConv, SAGPooling, GraphConv, GINConv, knn_interpolate
 from torch_geometric.nn import Sequential as GeoSequential
 from torch_geometric.nn.pool.topk_pool import filter_adj, topk
 from torch_geometric.utils import softmax
@@ -30,20 +30,68 @@ def get_deg(x, edge_index):
   return deg
 
 
+class GINMLP(nn.Module):
+
+  def __init__(self,
+               in_channels: int,
+               hid_channels: int,
+               out_channels: int,
+               act: callable = torch.nn.functional.relu):
+    super(GINMLP, self).__init__()
+    self.in_channels = in_channels
+    self.hid_channels = hid_channels
+    self.out_channels = out_channels
+    self.act = act
+
+    self.lin_0 = Linear(in_channels, hid_channels).cuda()
+    self.lin_1 = Linear(hid_channels, out_channels).cuda()
+    self.lin_2 = Linear(out_channels, hid_channels).cuda()
+    self.lin_3 = Linear(hid_channels, out_channels).cuda()
+
+  def forward(self, x):
+    out1 = self.act(self.lin_0(x), inplace=True)
+    out1 = self.lin_1(out1)
+    out = self.act(self.lin_2(out1), inplace=True)
+    out = self.lin_3(out) + out1
+    return out
+  
+class SAGPGIN(nn.Module):
+  def __init__(self,in_channels: int,
+               out_channels: int,
+               hidden_channels: int,
+               act: callable = torch.nn.functional.relu):
+    super(SAGPGIN,self).__init__()
+    self.in_channels = in_channels
+    self.hidden_channels = hidden_channels
+    self.out_channels = out_channels
+    self.act = act
+
+    self.mlp = GINMLP(in_channels, hidden_channels, out_channels)
+    self.gin = GINConv(self.mlp)
+
+  def reset_parameters(self):
+    self.gin.reset_parameters()
+  
+  def forward(self, x, edge_index,
+                edge_weight = None, size = None):
+    out = self.gin(x, edge_index, size)
+    return out
+
+
 class SAGPoolWithPos(SAGPooling):
 
   def __init__(
       self,
       in_channels: int,
       ratio: Union[float, int] = 0.5,
-      GNN: torch.nn.Module = SAGEConv,
+      GNN: torch.nn.Module = SAGPGIN,
       min_score: Optional[float] = None,
       multiplier: float = 1.0,
       nonlinearity: Union[str, Callable] = 'tanh',
       augmentation: bool = True,
       **kwargs,
   ):
-    super().__init__(in_channels, ratio, GNN, min_score, multiplier,
+    super(SAGPoolWithPos, self).__init__(in_channels, ratio, GNN, min_score, multiplier,
                      nonlinearity, **kwargs)
     self.augmentation = augmentation
 
@@ -103,10 +151,10 @@ class Encoder(nn.Module):
 
     # initial aggr
     self.conv_list = [
-        SAGEConv(self.in_channels, hidden_channels, aggr="max",
-                 project=True).cuda(),
-        SAGEConv(hidden_channels, hidden_channels, aggr="max",
-                 project=True).cuda(),
+        GINConv(GINMLP(self.in_channels, hidden_channels,
+                       hidden_channels)).cuda(),
+        GINConv(GINMLP(hidden_channels, hidden_channels,
+                       hidden_channels)).cuda(),
     ]
 
     # pools
@@ -114,17 +162,18 @@ class Encoder(nn.Module):
     for _ in range(n_pools):
       self.pool_list.append(
           SAGPoolWithPos(
-              hidden_channels + dim, pool_ratio, aggr="max",
-              project=True).cuda())
+              hidden_channels + dim,
+              pool_ratio,
+              hidden_channels=hidden_channels).cuda())
       self.conv_list.append(
-          SAGEConv(hidden_channels, hidden_channels, aggr="max",
-                   project=True).cuda())
+          GINConv(GINMLP(hidden_channels, hidden_channels,
+                         hidden_channels)).cuda())
 
     # latent dense map
     out_sz = get_pooled_sz(init_data.num_nodes, pool_ratio, n_pools)
     self.conv_list.append(
-        SAGEConv(hidden_channels, hidden_channels, aggr="max",
-                 project=True).cuda())
+        GINConv(GINMLP(hidden_channels, hidden_channels,
+                       hidden_channels)).cuda())
 
     self.lin_0 = Linear(out_sz*hidden_channels, latent_channels).cuda()
     self.lin_1 = Linear(latent_channels, latent_channels).cuda()
@@ -168,10 +217,10 @@ class StructureEncoder(Encoder):
 
     # initial aggr
     self.conv_list = [
-        SAGEConv(self.in_channels, hidden_channels, aggr="max",
-                 project=True).cuda(),
-        SAGEConv(hidden_channels, hidden_channels, aggr="max",
-                 project=True).cuda(),
+        GINConv(GINMLP(self.in_channels, hidden_channels,
+                       hidden_channels)).cuda(),
+        GINConv(GINMLP(hidden_channels, hidden_channels,
+                       hidden_channels)).cuda(),
     ]
 
     # pools
@@ -179,17 +228,18 @@ class StructureEncoder(Encoder):
     for _ in range(n_pools):
       self.pool_list.append(
           SAGPoolWithPos(
-              hidden_channels + dim + 1, pool_ratio, aggr="max",
-              project=True).cuda())
+              hidden_channels + dim + 1,
+              pool_ratio,
+              hidden_channels=hidden_channels).cuda())
       self.conv_list.append(
-          SAGEConv(hidden_channels, hidden_channels, aggr="max",
-                   project=True).cuda())
+          GINConv(GINMLP(hidden_channels, hidden_channels,
+                         hidden_channels)).cuda())
 
     # latent dense map
     out_sz = get_pooled_sz(init_data.num_nodes, pool_ratio, n_pools)
     self.conv_list.append(
-        SAGEConv(hidden_channels, hidden_channels, aggr="max",
-                 project=True).cuda())
+        GINConv(GINMLP(hidden_channels, hidden_channels,
+                       hidden_channels)).cuda())
 
     self.lin_0 = Linear(out_sz*hidden_channels, latent_channels).cuda()
     self.lin_1 = Linear(latent_channels, latent_channels).cuda()
@@ -243,21 +293,21 @@ class Decoder(nn.Module):
 
     # initial aggr
     self.conv_list = [
-        SAGEConv(hidden_channels, hidden_channels, aggr="max",
-                 project=True).cuda(),
-        SAGEConv(hidden_channels, hidden_channels, aggr="max",
-                 project=True).cuda()
+        GINConv(GINMLP(hidden_channels, hidden_channels,
+                       hidden_channels)).cuda(),
+        GINConv(GINMLP(hidden_channels, hidden_channels,
+                       hidden_channels)).cuda()
     ]
 
     # unpools
     for _ in range(n_pools):
       self.conv_list.append(
-          SAGEConv(hidden_channels, hidden_channels, aggr="max",
-                   project=True).cuda())
+          GINConv(GINMLP(hidden_channels, hidden_channels,
+                         hidden_channels)).cuda())
 
     self.conv_list.append(
-        SAGEConv(hidden_channels, self.out_channels, aggr="max",
-                 project=True).cuda())
+        GINConv(GINMLP(hidden_channels, hidden_channels,
+                       self.out_channels)).cuda())
 
   def get_edge_attr(self, edge_index, pos):
     edge_attr = torch.zeros((edge_index.size(1), 3)).cuda()
