@@ -46,11 +46,10 @@ if debug:
 torch.manual_seed(0)
 
 # loop through folders and load data
-ma_list = [
-    0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8
-]
+# ma_list = [0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8]
+ma_list = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
 # re_list = [1e6, 2e6, 3e6, 4e6, 5e6, 6e6, 7e6, 8e6, 9e6, 1e7]
-re_list = [2e6, 4e6, 6e6, 8e6, 9e6, 1e7]
+re_list = [2e6, 3e6, 5e6, 6e6, 8e6, 9e6]
 # aoa_list = [-12, -11, -10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
 aoa_list = [-9, -8, -7, -6, -5, -4, -3, 3, 4, 5, 6, 7, 8, 9]
 n_slices = 5
@@ -59,13 +58,13 @@ data_path = os.path.join(os.environ["SCRATCH"], "ORNL/dimension-bridging/data")
 if wandb_upload:
   train_dataset = PairDataset(data_path, ma_list, re_list, aoa_list, "train",
                               n_slices)
-  test_dataset = PairDataset(data_path, ma_list, [3e6, 5e6, 7e6], aoa_list,
+  test_dataset = PairDataset(data_path, ma_list, [4e6, 7e6, 1e7], aoa_list,
                              "test", n_slices)
 else:
-  train_dataset = PairDataset(data_path, [0.3], [3e6], [3], "idev-train",
-                              n_slices)
-  test_dataset = PairDataset(data_path, [0.6], [6e6], [6], "idev-test",
-                             n_slices)
+  train_dataset = PairDataset(data_path, [0.3, 0.4], [3e6, 4e6], [3, 4],
+                              "idev-train", n_slices)
+  test_dataset = PairDataset(data_path, [0.5, 0.6], [5e6, 6e6], [5, 6],
+                             "idev-test", n_slices)
 
 n_samples = len(train_dataset)
 batch_sz = int(np.min(np.array([1, n_samples])))
@@ -96,18 +95,19 @@ pool_ratio = args.pooling_ratio
 if debug:
   print('Init')
 
+n_epochs = 10000
+eps = 1e-15
+
 model = DBA(3, init_data, args.channels, args.latent_sz, k_size,
             args.pooling_layers, pool_ratio, device).to(device)
 opt = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
+sch = torch.optim.lr_scheduler.ExponentialLR(opt,0.9)
 loss_fn = torch.nn.MSELoss()
 
 save_path = os.path.join(data_path, "models_save", case_name,
                          today.strftime("%d%m%y"))
 if not os.path.exists(save_path):
   os.makedirs(save_path)
-
-n_epochs = 10000
-eps = 1e-15
 
 
 def train_step():
@@ -152,14 +152,13 @@ def main(n_epochs):
   if debug:
     print('Train')
   for epoch in range(n_epochs):
+    lr = sch._last_lr[0]
     loss = train_step()
-
-    # if debug:
-    #   print('Test')
     test_err = test_step()
+    sch.step()
 
     if debug:
-      print("Loss {:g}, Error {:g}, Epoch {:g}".format(loss, test_err, epoch))
+      print("Loss {:g}, Error {:g}, Epoch {:g}, LR {:g},".format(loss, test_err, epoch, lr))
     if epoch % 100 == 0 or epoch == n_epochs - 1:
       if wandb_upload:
         wandb.log({
@@ -176,6 +175,7 @@ def main(n_epochs):
           save_path,
           "model_ep-{:d}_L-{:g}_E-{:g}.pt".format(epoch, loss, test_err))
       torch.save(model.state_dict(), save)
+
       # if test_err == min_err:
       #   torch.save((edge_list, pos_list), epl + "_min.pt")
       # else:

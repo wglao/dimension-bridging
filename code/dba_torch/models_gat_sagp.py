@@ -149,7 +149,7 @@ class Encoder(nn.Module):
     # latent
     # out_sz = get_pooled_sz(init_data.num_nodes, pool_ratio, n_pools)
     self.conv_list.append(
-        GATv2Conv(hidden_channels + dim, latent_channels,
+        GATv2Conv(hidden_channels + dim, hidden_channels,
                   edge_dim=dim).to(self.device))
 
     self.lin = Linear(hidden_channels, latent_channels).to(self.device)
@@ -286,7 +286,7 @@ class Decoder(nn.Module):
 
     # initial aggr
     self.conv_list = nn.ModuleList([
-        GATv2Conv(latent_channels + dim, hidden_channels,
+        GATv2Conv(hidden_channels + dim, hidden_channels,
                   edge_dim=dim).to(self.device)
     ])
     self.conv_list.append(

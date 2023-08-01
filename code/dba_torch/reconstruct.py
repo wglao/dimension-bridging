@@ -4,7 +4,7 @@ import pyvista as pv
 import torch
 from torch_geometric.loader import DataLoader
 import numpy as np
-from models_gin_sagp import DBA
+from models_gat_sagp import DBA
 from graphdata import PairDataset
 
 import argparse
@@ -12,15 +12,15 @@ import argparse
 parser = argparse.ArgumentParser()
 
 parser.add_argument(
-    "--case-name", default="dba-sagpool", type=str, help="Architecture Name")
+    "--case-name", default="dba-gat-sagp", type=str, help="Architecture Name")
 parser.add_argument(
     "--channels", default=10, type=int, help="Aggregation Channels")
 parser.add_argument(
-    "--latent-sz", default=50, type=int, help="Latent Space Dimensionality")
+    "--latent-sz", default=10, type=int, help="Latent Space Dimensionality")
 parser.add_argument(
     "--pooling-layers", default=1, type=int, help="Number of Pooling Layers")
 parser.add_argument(
-    "--pooling-ratio", default=0.5, type=float, help="Pooling Ratio")
+    "--pooling-ratio", default=0.125, type=float, help="Pooling Ratio")
 parser.add_argument(
     "--learning-rate", default=1e-3, type=float, help="Learning Rate")
 parser.add_argument("--wandb", default=1, type=int, help="wandb upload")
@@ -30,14 +30,14 @@ parser.add_argument(
     "--reynolds", default=1.172e7, type=float, help="Reynolds Number")
 parser.add_argument("--aoa", default=3.06, type=float, help="Angle of Attack")
 parser.add_argument(
-    "--date", default="040723", type=str, help="Date of run in ddmmyy")
+    "--date", default="010823", type=str, help="Date of run in ddmmyy")
 parser.add_argument("--epoch", default=100, type=int, help="Checkpoint Epoch")
 
 args = parser.parse_args()
 case_name = "_".join([
     str(key) + "-" + str(value) for key, value in list(vars(args).items())[:-6]
 ])[10:]
-os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_id)
+device = "cuda:{:d}".format(args.gpu_id) if args.gpu_id >= 0 else "cpu"
 
 data_path = os.path.join(os.environ["SCRATCH"], "ORNL/dimension-bridging/data")
 save_path = os.path.join(data_path, "models_save")
@@ -45,29 +45,29 @@ save_path = os.path.join(data_path, "models_save")
 
 def main(save_path):
   n_slices = 5
-#   on_dataset = PairDataset(data_path, [args.mach], [args.reynolds],
-#                               [args.aoa], "recon", n_slices)
   recon_dataset = PairDataset(data_path, [args.mach], [args.reynolds],
-                              [args.aoa], "train", n_slices)
+                              [args.aoa], "recon", n_slices)
+  # recon_dataset = PairDataset(data_path, [args.mach], [args.reynolds],
+  #                             [args.aoa], "train", n_slices)
 #   recon_dataset = PairDataset(data_path, [args.mach], [args.reynolds],
 #                               [args.aoa], "test", n_slices)
 #   recon_dataset = PairDataset(data_path, [args.mach], [args.reynolds],
 #                               [args.aoa], "all", n_slices)
   recon_loader = DataLoader(recon_dataset)
 
-  pair = next(iter(recon_loader))[0].cuda()
+  pair = next(iter(recon_loader))[0].to(device)
 
   # set kernel size to mean of node degree vector
   idx = pair.edge_index_3
   sz = pair.x_3.shape[0]
-  con = torch.ones((idx.size(1),)).cuda()
+  con = torch.ones((idx.size(1),)).to(device)
   adj = torch.sparse_coo_tensor(idx, con, (sz, sz))
-  deg = adj.matmul(torch.ones((sz, 1)).cuda())
+  deg = adj.matmul(torch.ones((sz, 1)).to(device))
   k_size = int(torch.ceil(torch.mean(deg) / 3))
   del idx, sz, adj, deg
 
   model = DBA(3, pair, args.channels, args.latent_sz, k_size,
-              args.pooling_layers, args.pooling_ratio).cuda()
+              args.pooling_layers, args.pooling_ratio, device).to(device)
 
   # get save
   run_path = os.path.join(save_path, case_name, args.date)
@@ -78,17 +78,13 @@ def main(save_path):
   if save is not None:
     state_dict = torch.load(save)
     model.load_state_dict(state_dict)
-    epl = torch.load(os.path.join(run_path, "epl_min.pt"))
-    edge_list = epl[0]
-    pos_list = epl[1]
     print("Model found.")
   else:
     print("Model with requested architecture and epoch not saved.\nExiting.")
     return
 
   model.eval()
-  f_recon = model(None, None, None, pair.x_2, pair.edge_index_2, pair.pos_2,
-                  edge_list, pos_list)
+  f_recon, _, _ = model(pair.x_3, pair.edge_index_3, pair.pos_3, pair.x_2, pair.edge_index_2, pair.pos_2, pair.y)
   mse_rho = torch.nn.MSELoss()(f_recon[:, 0], pair.x_3[:, 0])
   mse_u = torch.nn.MSELoss()(f_recon[:, 1:4], pair.x_3[:, 1:4])
   mse_e = torch.nn.MSELoss()(f_recon[:, 4], pair.x_3[:, 4])
