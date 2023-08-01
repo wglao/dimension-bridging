@@ -114,30 +114,29 @@ def train_step():
   model.train()
   loss = 0
   for pair_batch in train_loader:
+    opt.zero_grad()
     pair_batch = pair_batch.to(device)
-    out, edge_list, pos_list = model(pair_batch.x_3, pair_batch.edge_index_3,
-                                     pair_batch.pos_3, pair_batch.x_2,
-                                     pair_batch.edge_index_2, pair_batch.pos_2)
-
+    out, _, _ = model(pair_batch.x_3, pair_batch.edge_index_3, pair_batch.pos_3,
+                      pair_batch.x_2, pair_batch.edge_index_2, pair_batch.pos_2)
     batch_loss = loss_fn(out, pair_batch.x_3)
     batch_loss.backward()
     opt.step()
 
     loss += batch_loss
-  loss /= len(train_loader.dataset)
-  return loss, edge_list, pos_list
+  loss /= batches
+  return loss
 
 
-def test_step(edge_list, pos_list):
+def test_step():
   model.eval()
   test_err = 0
   for pair_batch in test_loader:
     pair_batch = pair_batch.to(device)
-    out = model(None, None, None, pair_batch.x_2, pair_batch.edge_index_2,
-                pair_batch.pos_2, edge_list, pos_list)
+    out, _, _ = model(pair_batch.x_3, pair_batch.edge_index_3, pair_batch.pos_3,
+                      pair_batch.x_2, pair_batch.edge_index_2, pair_batch.pos_2)
     batch_loss = loss_fn(out, pair_batch.x_3)
     test_err += batch_loss
-  test_err /= len(test_loader.dataset)
+  test_err /= test_batches
   return test_err
 
 
@@ -149,11 +148,11 @@ def main(n_epochs):
   if debug:
     print('Train')
   for epoch in range(n_epochs):
-    loss, edge_list, pos_list = train_step()
+    loss = train_step()
 
     # if debug:
     #   print('Test')
-    test_err = test_step(edge_list, pos_list)
+    test_err = test_step()
 
     if debug:
       print("Loss: {:g}, Error {:g}, Epoch {:g}".format(loss, test_err, epoch))
@@ -173,10 +172,10 @@ def main(n_epochs):
           save_path,
           "model_ep-{:d}_L-{:g}_E-{:g}.pt".format(epoch, loss, test_err))
       torch.save(model.state_dict(), save)
-      if test_err == min_err:
-        torch.save((edge_list, pos_list), epl + "_min.pt")
-      else:
-        torch.save((edge_list, pos_list), epl + "_final.pt")
+      # if test_err == min_err:
+      #   torch.save((edge_list, pos_list), epl + "_min.pt")
+      # else:
+      #   torch.save((edge_list, pos_list), epl + "_final.pt")
 
 
 if __name__ == "__main__":

@@ -114,6 +114,7 @@ def train_step():
   model.train()
   loss = 0
   for pair_batch in train_loader:
+    opt.zero_grad()
     pair_batch = pair_batch.to(device)
     out, _, _ = model(pair_batch.x_3, pair_batch.edge_index_3, pair_batch.pos_3,
                       pair_batch.x_2, pair_batch.edge_index_2, pair_batch.pos_2,
@@ -160,7 +161,7 @@ def main(n_epochs):
     if debug:
       print("Loss {:g}, Error {:g}, Epoch {:g}".format(loss, test_err, epoch))
     if epoch % 100 == 0 or epoch == n_epochs - 1:
-      if wandb_upload and not debug:
+      if wandb_upload:
         wandb.log({
             "Loss": loss,
             "Error": test_err,
@@ -182,8 +183,9 @@ def main(n_epochs):
 
 
 if __name__ == "__main__":
-  if wandb_upload and not debug:
+  if wandb_upload:
     import wandb
+    case_name = "debug_" + case_name if debug else case_name
     wandb.init(
         project="DB-GNN",
         entity="wglao",

@@ -5,11 +5,11 @@ from typing import Tuple, Union, Optional, Callable
 from torch import nn
 from torch_geometric.data import Batch, Data
 from torch_geometric.loader import ClusterData, ClusterLoader
-from torch_geometric.nn import SAGEConv, SAGPooling, GATv2Conv, GraphConv, GINConv, knn_interpolate
+from torch_geometric.nn import SAGEConv, SAGPooling, GATv2Conv, GraphConv, GINConv, Linear, knn_interpolate
 from torch_geometric.nn import Sequential as GeoSequential
 from torch_geometric.nn.pool.topk_pool import filter_adj, topk
 from torch_geometric.utils import softmax
-from torch.nn import Linear, ReLU, Sequential
+from torch.nn import ReLU, Sequential
 import torch.nn.functional as F
 from graphdata import PairData
 import numpy as np
@@ -152,6 +152,8 @@ class Encoder(nn.Module):
         GATv2Conv(hidden_channels + dim, latent_channels,
                   edge_dim=dim).to(self.device))
 
+    self.lin = Linear(hidden_channels, latent_channels).to(self.device)
+
   def forward(self, x, y, edge_index, pos):
     edge_attr = get_edge_attr(edge_index, pos)
     x = F.elu(
@@ -181,6 +183,7 @@ class Encoder(nn.Module):
     x = F.elu(
         self.conv_list[-1](torch.cat((x, pos), dim=1), edge_index, edge_attr),
         inplace=True)
+    x = torch.vmap(self.lin, in_dims=(0,))(x)
     return x, pool_edge_list, pool_pos_list, edge_attr_list
 
 
@@ -279,12 +282,16 @@ class Decoder(nn.Module):
 
     # latent dense map
     # self.out_sz = get_pooled_sz(init_data.num_nodes, pool_ratio, n_pools)
+    self.lin = Linear(latent_channels, hidden_channels).to(self.device)
 
     # initial aggr
-    self.conv_list = nn.ModuleList(
-        [GATv2Conv(latent_channels + dim, hidden_channels, edge_dim=dim).to(self.device)])
+    self.conv_list = nn.ModuleList([
+        GATv2Conv(latent_channels + dim, hidden_channels,
+                  edge_dim=dim).to(self.device)
+    ])
     self.conv_list.append(
-        GATv2Conv(hidden_channels + dim, hidden_channels, edge_dim=dim).to(self.device))
+        GATv2Conv(hidden_channels + dim, hidden_channels,
+                  edge_dim=dim).to(self.device))
 
     # # no initial aggr
     # self.conv_list = nn.ModuleList()
@@ -301,12 +308,12 @@ class Decoder(nn.Module):
 
   def forward(self, latent, edge_index_list, pos_list, edge_attr_list):
     # INITIAL AGG
+    x = F.elu(torch.vmap(self.lin, in_dims=(0,))(latent), inplace=True)
     edge_index = edge_index_list[0]
     pos = pos_list[0]
     edge_attr = get_edge_attr(edge_index, pos)
     x = F.elu(
-        self.conv_list[0](torch.cat((latent, pos), dim=1), edge_index,
-                          edge_attr),
+        self.conv_list[0](torch.cat((x, pos), dim=1), edge_index, edge_attr),
         inplace=True)
     x = F.elu(
         self.conv_list[1](torch.cat((x, pos), dim=1), edge_index, edge_attr),
