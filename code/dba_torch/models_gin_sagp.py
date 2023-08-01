@@ -22,11 +22,11 @@ def get_pooled_sz(full_sz: int, ratio: float, layer: int):
   return out_sz
 
 
-def get_deg(x, edge_index):
+def get_deg(x, edge_index, device: str = "cpu"):
   deg = torch.sparse_coo_tensor(edge_index,
                                 torch.ones(
-                                    (edge_index.size(1),)).cuda()) @ torch.ones(
-                                        (x.size(0), 1)).cuda()
+                                    (edge_index.size(1),)).to(device)).to(device) @ torch.ones(
+                                        (x.size(0), 1)).to(device)
   return deg
 
 
@@ -36,17 +36,19 @@ class GINMLP(nn.Module):
                in_channels: int,
                hid_channels: int,
                out_channels: int,
-               act: callable = torch.nn.functional.relu):
+               act: callable = torch.nn.functional.relu,
+               device: str = "cpu"):
     super(GINMLP, self).__init__()
     self.in_channels = in_channels
     self.hid_channels = hid_channels
     self.out_channels = out_channels
     self.act = act
+    self.device = device
 
-    self.lin_0 = Linear(in_channels, hid_channels).cuda()
-    self.lin_1 = Linear(hid_channels, out_channels).cuda()
-    self.lin_2 = Linear(out_channels, hid_channels).cuda()
-    self.lin_3 = Linear(hid_channels, out_channels).cuda()
+    self.lin_0 = Linear(in_channels, hid_channels).to(self.device)
+    self.lin_1 = Linear(hid_channels, out_channels).to(self.device)
+    self.lin_2 = Linear(out_channels, hid_channels).to(self.device)
+    self.lin_3 = Linear(hid_channels, out_channels).to(self.device)
 
   def forward(self, x):
     out1 = self.act(self.lin_0(x), inplace=True)
@@ -54,26 +56,30 @@ class GINMLP(nn.Module):
     out = self.act(self.lin_2(out1), inplace=True)
     out = self.lin_3(out) + out1
     return out
-  
+
+
 class SAGPGIN(nn.Module):
-  def __init__(self,in_channels: int,
+
+  def __init__(self,
+               in_channels: int,
                out_channels: int,
                hidden_channels: int,
-               act: callable = torch.nn.functional.relu):
-    super(SAGPGIN,self).__init__()
+               act: callable = torch.nn.functional.relu,
+               device: str = "cpu"):
+    super(SAGPGIN, self).__init__()
     self.in_channels = in_channels
     self.hidden_channels = hidden_channels
     self.out_channels = out_channels
     self.act = act
+    self.device = device
 
-    self.mlp = GINMLP(in_channels, hidden_channels, out_channels)
-    self.gin = GINConv(self.mlp)
+    self.mlp = GINMLP(in_channels, hidden_channels, out_channels, device=device).to(device)
+    self.gin = GINConv(self.mlp).to(device)
 
   def reset_parameters(self):
     self.gin.reset_parameters()
-  
-  def forward(self, x, edge_index,
-                edge_weight = None, size = None):
+
+  def forward(self, x, edge_index, edge_weight=None, size=None):
     out = self.gin(x, edge_index, size)
     return out
 
@@ -89,11 +95,13 @@ class SAGPoolWithPos(SAGPooling):
       multiplier: float = 1.0,
       nonlinearity: Union[str, Callable] = 'tanh',
       augmentation: bool = True,
+      device: str = "cpu",
       **kwargs,
   ):
-    super(SAGPoolWithPos, self).__init__(in_channels, ratio, GNN, min_score, multiplier,
-                     nonlinearity, **kwargs)
+    super(SAGPoolWithPos, self).__init__(in_channels, ratio, GNN, min_score,
+                                         multiplier, nonlinearity, **kwargs)
     self.augmentation = augmentation
+    self.device = device
 
   def forward(
       self,
@@ -111,7 +119,7 @@ class SAGPoolWithPos(SAGPooling):
     attn = attn.unsqueeze(-1) if attn.dim() == 1 else attn
     if self.augmentation:
       adj = torch.sparse_coo_tensor(edge_index,
-                                    torch.ones(edge_index.size(1),).cuda())
+                                    torch.ones(edge_index.size(1),).to(self.device))
       adj_aug = (adj + (adj@adj)).coalesce()
       edge_index_aug = adj_aug.indices()
       score = self.gnn(attn, edge_index_aug).view(-1)
@@ -139,7 +147,7 @@ class Encoder(nn.Module):
 
   def __init__(self, dim: int, init_data: Data, hidden_channels: int,
                latent_channels: int, k_size: int, n_pools: int,
-               pool_ratio: float):
+               pool_ratio: float, device: str = "cpu"):
     super(Encoder, self).__init__()
     self.dim = dim
     self.in_channels = init_data.num_node_features
@@ -148,38 +156,41 @@ class Encoder(nn.Module):
     self.k_size = k_size
     self.n_pools = n_pools
     self.pool_ratio = pool_ratio
+    self.device = device
 
     # initial aggr
-    self.conv_list = [
+    self.conv_list = nn.ModuleList([
         GINConv(GINMLP(self.in_channels, hidden_channels,
-                       hidden_channels)).cuda(),
+                       hidden_channels, device=device)).to(self.device)
+    ])
+    self.conv_list.append(
         GINConv(GINMLP(hidden_channels, hidden_channels,
-                       hidden_channels)).cuda(),
-    ]
+                       hidden_channels, device=device)).to(self.device))
 
     # pools
-    self.pool_list = []
+    self.pool_list = nn.ModuleList()
     for _ in range(n_pools):
       self.pool_list.append(
           SAGPoolWithPos(
               hidden_channels + dim,
               pool_ratio,
-              hidden_channels=hidden_channels).cuda())
+              hidden_channels=hidden_channels,
+              device=device).to(self.device))
       self.conv_list.append(
           GINConv(GINMLP(hidden_channels, hidden_channels,
-                         hidden_channels)).cuda())
+                         hidden_channels, device=device)).to(self.device))
 
     # latent dense map
     out_sz = get_pooled_sz(init_data.num_nodes, pool_ratio, n_pools)
     self.conv_list.append(
         GINConv(GINMLP(hidden_channels, hidden_channels,
-                       hidden_channels)).cuda())
+                       hidden_channels, device=device)).to(self.device))
 
-    self.lin_0 = Linear(out_sz*hidden_channels, latent_channels).cuda()
-    self.lin_1 = Linear(latent_channels, latent_channels).cuda()
+    self.lin_0 = Linear(out_sz*hidden_channels, latent_channels, device=device).to(self.device)
+    self.lin_1 = Linear(latent_channels, latent_channels, device=device).to(self.device)
 
   def get_edge_attr(self, edge_index, pos):
-    edge_attr = torch.zeros((edge_index.size(1), 3)).cuda()
+    edge_attr = torch.zeros((edge_index.size(1), 3)).to(self.device)
     for i, xs in enumerate(edge_index.transpose(0, 1)):
       edge_attr[i] = pos[xs[1]] - pos[xs[0]]
     return edge_attr
@@ -209,50 +220,51 @@ class StructureEncoder(Encoder):
 
   def __init__(self, dim: int, init_data: Data, hidden_channels: int,
                latent_channels: int, k_size: int, n_pools: int,
-               pool_ratio: float):
+               pool_ratio: float, device: str = "cpu"):
     super(StructureEncoder,
           self).__init__(dim, init_data, hidden_channels, latent_channels,
-                         k_size, n_pools, pool_ratio)
+                         k_size, n_pools, pool_ratio, device)
     self.in_channels = self.dim + 1
 
     # initial aggr
-    self.conv_list = [
+    self.conv_list = nn.ModuleList([
         GINConv(GINMLP(self.in_channels, hidden_channels,
-                       hidden_channels)).cuda(),
+                       hidden_channels, device=device)).to(self.device)
+    ])
+    self.conv_list.append(
         GINConv(GINMLP(hidden_channels, hidden_channels,
-                       hidden_channels)).cuda(),
-    ]
+                       hidden_channels, device=device)).to(self.device))
 
     # pools
-    self.pool_list = []
+    self.pool_list = nn.ModuleList()
     for _ in range(n_pools):
       self.pool_list.append(
           SAGPoolWithPos(
               hidden_channels + dim + 1,
               pool_ratio,
-              hidden_channels=hidden_channels).cuda())
+              hidden_channels=hidden_channels, device=device).to(self.device))
       self.conv_list.append(
           GINConv(GINMLP(hidden_channels, hidden_channels,
-                         hidden_channels)).cuda())
+                         hidden_channels, device=device)).to(self.device))
 
     # latent dense map
     out_sz = get_pooled_sz(init_data.num_nodes, pool_ratio, n_pools)
     self.conv_list.append(
         GINConv(GINMLP(hidden_channels, hidden_channels,
-                       hidden_channels)).cuda())
+                       hidden_channels, device=device)).to(self.device))
 
-    self.lin_0 = Linear(out_sz*hidden_channels, latent_channels).cuda()
-    self.lin_1 = Linear(latent_channels, latent_channels).cuda()
+    self.lin_0 = Linear(out_sz*hidden_channels, latent_channels, device=device).to(self.device)
+    self.lin_1 = Linear(latent_channels, latent_channels, device=device).to(self.device)
 
   def get_edge_attr(self, edge_index, pos):
-    edge_attr = torch.zeros((edge_index.size(1), 3)).cuda()
+    edge_attr = torch.zeros((edge_index.size(1), 3)).to(self.device)
     for i, xs in enumerate(edge_index.transpose(0, 1)):
       edge_attr[i] = pos[xs[1]] - pos[xs[0]]
     return edge_attr
 
   def forward(self, x, edge_index, pos):
     # edge_attr = self.get_edge_attr(edge_index, pos)
-    deg = get_deg(x, edge_index)
+    deg = get_deg(x, edge_index, self.device)
     x = torch.cat([pos, deg], dim=1)
     x = F.relu(self.conv_list[0](x, edge_index), inplace=True)
     x = F.relu(self.conv_list[1](x, edge_index), inplace=True)
@@ -265,7 +277,7 @@ class StructureEncoder(Encoder):
       x = x[:, :-1]
       pool_edge_list.insert(0, edge_index)
       pool_pos_list.insert(0, pos)
-      deg = get_deg(x, edge_index)
+      deg = get_deg(x, edge_index, self.device)
 
       # edge_attr = self.get_edge_attr(edge_index, pos)
       x = F.relu(self.conv_list[l + 2](x, edge_index), inplace=True)
@@ -276,7 +288,7 @@ class Decoder(nn.Module):
 
   def __init__(self, dim: int, init_data: Data, hidden_channels: int,
                latent_channels: int, k_size: int, n_pools: int,
-               pool_ratio: float):
+               pool_ratio: float, device: str = "cpu"):
     super(Decoder, self).__init__()
     self.dim = dim
     self.out_channels = init_data.num_node_features
@@ -285,32 +297,34 @@ class Decoder(nn.Module):
     self.k_size = k_size
     self.n_pools = n_pools
     self.pool_ratio = pool_ratio
+    self.device = device
 
     # latent dense map
     self.out_sz = get_pooled_sz(init_data.num_nodes, pool_ratio, n_pools)
-    self.lin_0 = Linear(latent_channels, latent_channels).cuda()
-    self.lin_1 = Linear(latent_channels, self.out_sz*hidden_channels).cuda()
+    self.lin_0 = Linear(latent_channels, latent_channels, device=device).to(self.device)
+    self.lin_1 = Linear(latent_channels, self.out_sz*hidden_channels, device=device).to(self.device)
 
     # initial aggr
-    self.conv_list = [
+    self.conv_list = nn.ModuleList([
         GINConv(GINMLP(hidden_channels, hidden_channels,
-                       hidden_channels)).cuda(),
+                       hidden_channels, device=device)).to(self.device)
+    ])
+    self.conv_list.append(
         GINConv(GINMLP(hidden_channels, hidden_channels,
-                       hidden_channels)).cuda()
-    ]
+                       hidden_channels, device=device)).to(self.device))
 
     # unpools
     for _ in range(n_pools):
       self.conv_list.append(
           GINConv(GINMLP(hidden_channels, hidden_channels,
-                         hidden_channels)).cuda())
+                         hidden_channels, device=device)).to(self.device))
 
     self.conv_list.append(
         GINConv(GINMLP(hidden_channels, hidden_channels,
-                       self.out_channels)).cuda())
+                       self.out_channels, device=device)).to(self.device))
 
   def get_edge_attr(self, edge_index, pos):
-    edge_attr = torch.zeros((edge_index.size(1), 3)).cuda()
+    edge_attr = torch.zeros((edge_index.size(1), 3)).to(self.device)
     for i, xs in enumerate(edge_index.transpose(0, 1)):
       edge_attr[i] = pos[xs[1]] - pos[xs[0]]
     return edge_attr
@@ -327,7 +341,7 @@ class Decoder(nn.Module):
     x = F.relu(self.conv_list[1](x, edge_index), inplace=True)
 
     for l in range(self.n_pools):
-      deg = get_deg(x, edge_index)
+      deg = get_deg(x, edge_index, self.device)
       x = knn_interpolate(x, pos_list[l], pos_list[l + 1], k=int(deg.mean()))
       edge_index = edge_index_list[l + 1]
       # pos = pos_list[l + 1]
@@ -343,7 +357,7 @@ class DBA(nn.Module):
 
   def __init__(self, dim: int, init_data: PairData, hidden_channels: int,
                latent_channels: int, k_size: int, n_pools: int,
-               pool_ratio: float):
+               pool_ratio: float, device: str = "cpu"):
     super(DBA, self).__init__()
     self.dim = dim
     self.in_channels = init_data.num_node_features
@@ -352,21 +366,22 @@ class DBA(nn.Module):
     self.k_size = k_size
     self.n_pools = n_pools
     self.pool_ratio = pool_ratio
+    self.device = device
 
     # only used for getting pooling structure
     init_data_3 = Data(
         x=init_data.x_3, edge_index=init_data.edge_index_3, pos=init_data.pos_3)
     self.encoder3D = StructureEncoder(dim, init_data_3, hidden_channels,
                                       latent_channels, k_size, n_pools,
-                                      pool_ratio).cuda()
+                                      pool_ratio, device=device).to(self.device)
 
     # used for model eval
     init_data_2 = Data(
         x=init_data.x_2, edge_index=init_data.edge_index_2, pos=init_data.pos_2)
     self.encoder2D = Encoder(dim, init_data_2, hidden_channels, latent_channels,
-                             k_size, n_pools, pool_ratio).cuda()
+                             k_size, n_pools, pool_ratio, device=device).to(self.device)
     self.decoder = Decoder(dim, init_data_3, hidden_channels, latent_channels,
-                           k_size, n_pools, pool_ratio).cuda()
+                           k_size, n_pools, pool_ratio, device=device).to(self.device)
 
   def forward(self,
               x_3,

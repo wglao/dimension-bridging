@@ -119,6 +119,7 @@ class PairDataset(InMemoryDataset):
               x_2=graph_2.x,
               edge_index_2=graph_2.edge_index,
               pos_2=graph_2.pos,
+              y=torch.tensor([ma,re,a])
           )
 
           data_list.append(data)
