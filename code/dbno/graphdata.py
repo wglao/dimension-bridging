@@ -74,7 +74,12 @@ class PairDataset(InMemoryDataset):
           ]
           features_3 = np.concatenate(point_data_list, axis=1)
 
-          
+          idx, _, _ = v2i(mesh)
+
+          graph_3 = Data(
+              torch.tensor(features_3),
+              torch.tensor(idx),
+              pos=torch.tensor(coords))
 
           slice_idx = []
           slice_data = []
@@ -114,6 +119,7 @@ class PairDataset(InMemoryDataset):
               x_2=graph_2.x,
               edge_index_2=graph_2.edge_index,
               pos_2=graph_2.pos,
+              y=torch.tensor([ma,re,a])
           )
 
           data_list.append(data)
