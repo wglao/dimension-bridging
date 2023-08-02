@@ -14,8 +14,7 @@ from torch_geometric.data import Data
 
 
 def connect(edge):
-  indices = np.meshgrid(edge, edge)
-  indices = np.row_stack((indices[0].ravel(), indices[1].ravel()))
+  indices = np.row_stack((edge, np.flip(edge)))
   return indices
 
 

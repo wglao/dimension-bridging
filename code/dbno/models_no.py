@@ -481,8 +481,8 @@ class LaplaceLayer(nn.Module):
     self.device = device
 
     self.lin = Linear(channels, channels, bias=False).to(device)
-    self.kernel = Parameter(torch.Tensor(kept_modes, channels, channels)).to(device)
-
+    self.kernel = Parameter(torch.Tensor(kept_modes, channels,
+                                         channels)).to(device)
 
   def get_laplacian(self, x, edge_index, device: str = "cpu"):
     n_nodes = x.size(0)
@@ -490,28 +490,29 @@ class LaplaceLayer(nn.Module):
                                   torch.ones(edge_index.size(1),).to(device))
     deg_idx = torch.stack((torch.arange(n_nodes), torch.arange(n_nodes)),
                           dim=0).to(device)
-    sqrt_deg = torch.sparse_coo_tensor(
-        deg_idx, torch.sqrt(get_deg(x, edge_index, device)), (n_nodes, n_nodes))
-    eye = torch.sparse_coo_tensor(deg_idx,
-                                  torch.ones((n_nodes,)).to(device),
-                                  (n_nodes, n_nodes)).to(device)
-    lapl = (eye - (sqrt_deg@adj@sqrt_deg)).coalesce()
+    deg = torch.squeeze(get_deg(x, edge_index, device))
+    deg_mat = torch.sparse_coo_tensor(deg_idx, deg, (n_nodes, n_nodes))
+    breakpoint()
+    # move to cpu for memory
+    adj = adj.cpu().detach().to_dense()
+    sqrt_deg = (1 / deg_mat.cpu().detach().sqrt())
+    lapl = torch.eye(n_nodes) - sqrt_deg @ (adj@sqrt_deg)
     return lapl
 
-  def get_transform(self, x, edge_index, device: str = "cpu", ret_eigvals: bool = False):
+  def get_transform(self, x, edge_index, kept_modes, device: str = "cpu"):
+    # move to cpu for memory
     lapl = self.get_laplacian(x, edge_index, device)
-    eigval, eigvec = torch.linalg.eigh(lapl.to_dense())
-    basis = eigvec[:, :self.kept_modes]
-    if not ret_eigvals:
-      return basis
-    return eigval[:self.kept_modes], basis
+    # # LAPL TOO BIG FOR TORCH EIG
+    # _, eigvec = torch.linalg.eigh(lapl)
+    # # USE LOBPCG
+    _, basis = torch.lobpcg(lapl, kept_modes)
+    return basis.to(device)
 
   def forward(self, x, edge_index):
-    phi = self.get_transform(x, edge_index, self.device)
+    phi = self.get_transform(x, edge_index, self.kept_modes, self.device)
     v = torch.linalg.pinv(phi) @ x
     out = self.lin(x) + F.elu(phi @ (self.kernel @ v))
     return out
-
 
 
 class LNO(nn.Module):
@@ -537,15 +538,17 @@ class LNO(nn.Module):
 
     self.lapl_list = nn.ModuleList()
     for l in range(laplace_layers):
-      self.lapl_list.append(LaplaceLayer(hidden_channels, hidden_channels, kept_modes, device).to(device))
+      self.lapl_list.append(
+          LaplaceLayer(hidden_channels, kept_modes, device).to(device))
 
     self.lower = Linear(hidden_channels, out_channels).to(device)
 
   def forward(self, x, edge_index, pos, y):
-    x = self.lift(torch.cat((x, pos, y), dim=1))
+    x = self.lift(
+        torch.cat((x, pos, y*torch.ones_like(pos).to(self.device)), dim=1))
 
     for l in range(self.laplace_layers):
       x = self.lapl_list[l](x, edge_index)
-    
+
     out = self.lower(x)
     return out

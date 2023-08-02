@@ -14,8 +14,7 @@ from torch_geometric.data import Data
 
 
 def connect(edge):
-  indices = np.meshgrid(edge, edge)
-  indices = np.row_stack((indices[0].ravel(), indices[1].ravel()))
+  indices = np.row_stack((edge, np.flip(edge)))
   return indices
 
 
@@ -49,15 +48,12 @@ def combine(idx_list, dat_list, n_list):
 
 
 if __name__ == "__main__":
-  import argparse
+  # import argparse
 
-  parser = argparse.ArgumentParser()
-  parser.add_argument("--file", "-f", default="slice_0.vtk", type=str)
-  args = parser.parse_args()
+  # parser = argparse.ArgumentParser()
+  # parser.add_argument("--file", "-f", default="slice_0.vtk", type=str)
+  # args = parser.parse_args()
 
-  adj_list = []
-  for s in range(5):
-    fname = "data/ma_0.2/re_1e+08/a_0/slice_{:d}.vtk".format(s)
-    mesh = pv.read(fname)
-    adj_list.append(v2a(mesh))
-  idx, data = combine(adj_list)
+  fname = "../data/ma_0.2/re_2e+06/a_5/flow.vtu"
+  mesh = pv.read(fname)
+  v2i(mesh)
