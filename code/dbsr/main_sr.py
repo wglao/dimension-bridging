@@ -38,7 +38,7 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.data import Data
 from torch_geometric.nn import knn_interpolate
 
-from models_mgn import DBMGN, get_deg
+from models_sr import DBMGN, get_deg
 from graphdata import PairData, PairDataset
 
 if not wandb_upload:

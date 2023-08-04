@@ -1,5 +1,6 @@
 import os
 import sys
+import glob
 from datetime import date
 import shutil
 from functools import partial
@@ -66,8 +67,7 @@ if wandb_upload:
 else:
   # train_dataset = PairDataset(data_path, [0.3, 0.4], [3e6, 4e6], [3, 4],
   #                             "idev-train", n_slices)
-  train_dataset = PairDataset(data_path, [0.3, 0.4], [3e6, 4e6], [3, 4],
-                              "recon", n_slices)
+  train_dataset = PairDataset(data_path, [0.3], [3e6], [3], "recon", n_slices)
   test_dataset = PairDataset(data_path, [0.5, 0.6], [5e6, 6e6], [5, 6],
                              "idev-test", n_slices)
 
@@ -86,22 +86,71 @@ init_pair = init_pair[0].to(device)
 init_data = Data(
     init_pair.x_3, init_pair.edge_index_3, y=init_pair.y, pos=init_pair.pos_3)
 
+transform_path = os.path.join(os.environ["SCRATCH"],
+                              "ORNL/dimension-bridging/data/processed/eig")
+if not os.path.exists(transform_path):
+  os.makedirs(transform_path, exist_ok=True)
+
+n_eigvecs = len(glob.glob(os.path.join(transform_path, "*.pt")))
+
+if n_eigvecs < args.kept_modes:
+
+  def get_deg(x, edge_index):
+    deg = torch.sparse_coo_tensor(edge_index, torch.ones(
+        (edge_index.size(1),))) @ torch.ones((x.size(0), 1))
+    return deg
+
+  def get_laplacian(x, edge_index):
+    n_nodes = x.size(0)
+    adj = torch.sparse_coo_tensor(edge_index, torch.ones(edge_index.size(1),))
+    deg_idx = torch.stack((torch.arange(n_nodes), torch.arange(n_nodes)), dim=0)
+    deg = torch.squeeze(get_deg(x, edge_index))
+    sqrt_deg = torch.sparse_coo_tensor(deg_idx, 1 / deg, (n_nodes, n_nodes))
+    lapl = (torch.eye(n_nodes).to_sparse_coo() -
+            sqrt_deg @ (adj@sqrt_deg)).coalesce()
+    return lapl
+
+  def get_basis(x, edge_index, kept_modes):
+    lapl = get_laplacian(x, edge_index).to_dense()
+    # # LAPL TOO BIG FOR TORCH EIG
+    # _, eigvec = torch.linalg.eigh(lapl)
+
+    # # USE LOBPCG
+    vals, basis = torch.lobpcg(lapl, kept_modes, niter=-1)
+    breakpoint()
+    return vals, basis
+
+  # move to cpu for memory
+  init_data.cpu().detach()
+  vals, basis = get_basis(init_data.x, init_data.edge_index, args.kept_modes)
+  torch.save(vals, os.path.join(transform_path, "vals.pt"))
+  for i, vec in enumerate(basis.transpose(0, 1)):
+    save = os.path.join(transform_path, "vec_{:d}.pt".format(i))
+    if os.path.exists(save):
+      os.remove(save)
+    torch.save(vec, save)
+
 if debug:
   print('Init')
 
-n_epochs = 1000
+n_epochs = 10000
 eps = 1e-15
 
-model = LNO(3, init_data, args.channels, 5, device=device).to(device)
+# 3 DIM: X, Y, Z
+# 5 OUT CHANNELS: RHO, Px, Py, Pz, E
+model = LNO(
+    3, init_data, args.channels, 5, args.kept_modes, device=device).to(device)
 opt = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-sch = torch.optim.lr_scheduler.ExponentialLR(opt, args.decay)
-plat = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5)
+sch = torch.optim.lr_scheduler.LinearLR(opt,1,1e-1,1000)
+# sch = torch.optim.lr_scheduler.ExponentialLR(opt, args.decay)
+# plat = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=1.25, patience = 20)
 loss_fn = torch.nn.MSELoss()
 
 save_path = os.path.join(data_path, "models_save", case_name,
                          today.strftime("%d%m%y"))
 if not os.path.exists(save_path):
   os.makedirs(save_path)
+
 
 # TODO: define more appropriate interpolation
 def interpolate(f, x, y):
@@ -115,7 +164,7 @@ def train_step():
     opt.zero_grad()
     pair_batch = pair_batch.to(device)
     x = interpolate(pair_batch.x_2, pair_batch.pos_2, pair_batch.pos_3)
-    out, _, _ = model(x, pair_batch.edge_index_3, pair_batch.pos_3, pair_batch.y)
+    out = model(x, pair_batch.pos_3, pair_batch.y)
 
     batch_loss = loss_fn(out, pair_batch.x_3)
     batch_loss.backward()
@@ -132,9 +181,8 @@ def test_step():
     test_err = 0
     for pair_batch in test_loader:
       pair_batch = pair_batch.to(device)
-      out, _, _ = model(pair_batch.x_3, pair_batch.edge_index_3,
-                        pair_batch.pos_3, pair_batch.x_2,
-                        pair_batch.edge_index_2, pair_batch.pos_2, pair_batch.y)
+      x = interpolate(pair_batch.x_2, pair_batch.pos_2, pair_batch.pos_3)
+      out = model(x, pair_batch.pos_3, pair_batch.y)
       batch_loss = loss_fn(out, pair_batch.x_3)
       test_err += batch_loss
     test_err /= test_batches
@@ -150,11 +198,12 @@ def main(n_epochs):
     print('Train')
   for epoch in range(n_epochs):
     lr = sch._last_lr[0]
+    # lr = args.learning_rate
     loss = train_step()
     test_err = test_step()
     if lr > 1e-5:
       sch.step()
-    plat.step(loss)
+    # plat.step(loss)
 
     if debug:
       print("Loss {:g}, Error {:g}, Epoch {:g}, LR {:g},".format(

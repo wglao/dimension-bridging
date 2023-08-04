@@ -26,8 +26,8 @@ def v2i(mesh):
 
   indices = np.array([connect(edge) for edge in edges])
   indices = np.concatenate(indices, axis=-1)
-  main_diag = np.row_stack((np.arange(n_nodes), np.arange(n_nodes)))
-  indices = np.concatenate((indices, main_diag), axis=-1)
+  # main_diag = np.row_stack((np.arange(n_nodes), np.arange(n_nodes)))
+  # indices = np.concatenate((indices, main_diag), axis=-1)
 
   data = np.ones((indices.shape[0],))
 

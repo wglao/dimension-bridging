@@ -1,11 +1,8 @@
-import os
-import math
 import torch
 from torch import Tensor
 from torch_geometric.typing import OptTensor
 from typing import Tuple, Union, Optional, Callable
 from torch import nn
-from torch.nn.parameter import Parameter
 from torch_geometric.data import Batch, Data
 from torch_geometric.loader import ClusterData, ClusterLoader
 from torch_geometric.nn import SAGEConv, SAGPooling, GATv2Conv, GraphConv, GINConv, Linear, knn_interpolate
@@ -39,18 +36,6 @@ def get_edge_attr(edge_index, pos):
   #   edge_attr[i] = pos[xs[1]] - pos[xs[0]]
   edge_attr = pos[edge_index[1]] - pos[edge_index[0]]
   return edge_attr
-
-
-def get_edge_aug(edge_index, pos, steps: int = 1, device: str = "cpu"):
-  adj = torch.sparse_coo_tensor(edge_index,
-                                torch.ones(edge_index.size(1),).to(device))
-  adj_aug = adj
-  for _ in range(steps):
-    adj_aug = (adj_aug @ adj).coalesce()
-  adj_aug = (adj + adj_aug).coalesce()
-  edge_index_aug = adj_aug.indices()
-  edge_attr_aug = get_edge_attr(edge_index_aug, pos)
-  return edge_index_aug, edge_attr_aug
 
 
 class SAGPoolWithPos(SAGPooling):
@@ -139,21 +124,13 @@ class Encoder(nn.Module):
     self.device = device
 
     # initial aggr
-    self.lin_list = nn.ModuleList(
-        [Linear(self.in_channels + dim + 3, hidden_channels).to(device)])
-
     self.conv_list = nn.ModuleList([
-        GATv2Conv(hidden_channels + dim, hidden_channels,
-                  edge_dim=dim).to(device)
+        GATv2Conv(self.in_channels + dim + 3, hidden_channels,
+                  edge_dim=dim).to(self.device)
     ])
-    self.lin_list.append(
-        Linear(hidden_channels + dim, hidden_channels).to(device))
-
     self.conv_list.append(
         GATv2Conv(hidden_channels + dim, hidden_channels,
-                  edge_dim=dim).to(device))
-    self.lin_list.append(
-        Linear(hidden_channels + dim, hidden_channels).to(device))
+                  edge_dim=dim).to(self.device))
 
     # pools
     self.pool_list = nn.ModuleList()
@@ -164,34 +141,27 @@ class Encoder(nn.Module):
               pool_ratio,
               hidden_channels=hidden_channels,
               edge_dim=dim,
-              device=device).to(device))
+              device=self.device).to(self.device))
       self.conv_list.append(
           GATv2Conv(hidden_channels + dim, hidden_channels,
-                    edge_dim=dim).to(device))
-      self.lin_list.append(
-          Linear(hidden_channels + dim, hidden_channels).to(device))
+                    edge_dim=dim).to(self.device))
 
     # latent
     # out_sz = get_pooled_sz(init_data.num_nodes, pool_ratio, n_pools)
     self.conv_list.append(
         GATv2Conv(hidden_channels + dim, hidden_channels,
-                  edge_dim=dim).to(device))
-    self.lin_list.append(
-        Linear(hidden_channels + dim, hidden_channels).to(device))
+                  edge_dim=dim).to(self.device))
 
-    self.lin_list.append(Linear(hidden_channels, latent_channels).to(device))
+    self.lin = Linear(hidden_channels, latent_channels).to(self.device)
 
   def forward(self, x, y, edge_index, pos):
-    x = self.lin_list[0](torch.cat((x, pos, y*torch.ones_like(pos)), dim=1))
-
-    # edge_attr = get_edge_attr(edge_index, pos)
-    edge_aug, edge_attr = get_edge_aug(edge_index, pos, self.k_size, self.device)
+    edge_attr = get_edge_attr(edge_index, pos)
     x = F.elu(
-        self.conv_list[0](torch.cat((x, pos), dim=1), edge_aug, edge_attr) + self.lin_list[1](
-            torch.cat((x, pos), dim=1)))
+        self.conv_list[0](torch.cat((x, pos, y*torch.ones_like(pos)), dim=1),
+                          edge_index, edge_attr),
+        inplace=True)
     x = F.elu(
-        self.conv_list[1](torch.cat((x, pos), dim=1), edge_aug, edge_attr) + self.lin_list[2](
-            torch.cat((x, pos), dim=1)),
+        self.conv_list[1](torch.cat((x, pos), dim=1), edge_index, edge_attr),
         inplace=True)
 
     pool_edge_list = [edge_index]
@@ -199,24 +169,21 @@ class Encoder(nn.Module):
     edge_attr_list = [edge_attr]
     for l, pool in enumerate(self.pool_list):
       x, edge_index, pos, _, _, _, _ = pool(x, edge_index, pos)
-      # edge_attr = get_edge_attr(edge_index, pos)
-      edge_aug, edge_attr = get_edge_aug(edge_index, pos, self.k_size, self.device)
+      edge_attr = get_edge_attr(edge_index, pos)
 
       pool_edge_list.insert(0, edge_index)
       pool_pos_list.insert(0, pos)
       edge_attr_list.insert(0, edge_attr)
 
       x = F.elu(
-          self.conv_list[l + 3](torch.cat(
-              (x, pos), dim=1), edge_aug, edge_attr) + self.lin_list[l + 2](
-              torch.cat((x, pos), dim=1)),
+          self.conv_list[l + 2](torch.cat((x, pos), dim=1), edge_index,
+                                edge_attr),
           inplace=True)
 
     x = F.elu(
-        self.conv_list[-1](torch.cat((x, pos), dim=1), edge_aug, edge_attr) + self.lin_list[-2](
-            torch.cat((x, pos), dim=1)),
+        self.conv_list[-1](torch.cat((x, pos), dim=1), edge_index, edge_attr),
         inplace=True)
-    x = self.lin_list[-1](x)
+    x = torch.vmap(self.lin, in_dims=(0,))(x)
     return x, pool_edge_list, pool_pos_list, edge_attr_list
 
 
@@ -315,22 +282,16 @@ class Decoder(nn.Module):
 
     # latent dense map
     # self.out_sz = get_pooled_sz(init_data.num_nodes, pool_ratio, n_pools)
-    self.lin_list = nn.ModuleList(
-        [Linear(latent_channels, hidden_channels).to(device)])
+    self.lin = Linear(latent_channels, hidden_channels).to(self.device)
 
     # initial aggr
     self.conv_list = nn.ModuleList([
         GATv2Conv(hidden_channels + dim, hidden_channels,
-                  edge_dim=dim).to(device)
+                  edge_dim=dim).to(self.device)
     ])
-    self.lin_list.append(
-        Linear(hidden_channels + dim, hidden_channels).to(device))
-
     self.conv_list.append(
         GATv2Conv(hidden_channels + dim, hidden_channels,
-                  edge_dim=dim).to(device))
-    self.lin_list.append(
-        Linear(hidden_channels + dim, hidden_channels).to(device))
+                  edge_dim=dim).to(self.device))
 
     # # no initial aggr
     # self.conv_list = nn.ModuleList()
@@ -339,33 +300,23 @@ class Decoder(nn.Module):
     for _ in range(n_pools):
       self.conv_list.append(
           GATv2Conv(hidden_channels + dim, hidden_channels,
-                    edge_dim=dim).to(device))
-      self.lin_list.append(
-          Linear(hidden_channels + dim, hidden_channels).to(device))
+                    edge_dim=dim).to(self.device))
 
     self.conv_list.append(
-        GATv2Conv(hidden_channels + dim, hidden_channels,
-                  edge_dim=dim).to(device))
-    self.lin_list.append(
-        Linear(hidden_channels + dim, hidden_channels).to(device))
-    self.lin_list.append(
-        Linear(hidden_channels + dim, self.out_channels).to(device))
+        GATv2Conv(hidden_channels + dim, self.out_channels,
+                  edge_dim=dim).to(self.device))
 
   def forward(self, latent, edge_index_list, pos_list, edge_attr_list):
     # INITIAL AGG
-    x = self.lin_list[0](latent)
-
+    x = F.elu(torch.vmap(self.lin, in_dims=(0,))(latent), inplace=True)
     edge_index = edge_index_list[0]
     pos = pos_list[0]
-    # edge_attr = get_edge_attr(edge_index, pos)
-    edge_aug, edge_attr = get_edge_aug(edge_index, pos, self.k_size, self.device)
+    edge_attr = get_edge_attr(edge_index, pos)
     x = F.elu(
-        self.conv_list[0](torch.cat((x, pos), dim=1), edge_aug, edge_attr) + self.lin_list[1](
-            torch.cat((x, pos), dim=1)),
+        self.conv_list[0](torch.cat((x, pos), dim=1), edge_index, edge_attr),
         inplace=True)
     x = F.elu(
-        self.conv_list[1](torch.cat((x, pos), dim=1), edge_aug, edge_attr) + self.lin_list[2](
-            torch.cat((x, pos), dim=1)),
+        self.conv_list[1](torch.cat((x, pos), dim=1), edge_index, edge_attr),
         inplace=True)
 
     # # NO INITIAL AGG
@@ -376,26 +327,20 @@ class Decoder(nn.Module):
       x = knn_interpolate(x, pos_list[l], pos_list[l + 1])
       edge_index = edge_index_list[l + 1]
       pos = pos_list[l + 1]
-      # edge_attr = edge_attr_list[l + 1]
-      edge_aug, edge_attr = get_edge_aug(edge_index, pos, self.k_size, self.device)
+      edge_attr = edge_attr_list[l + 1]
 
       # WITH INITIAL AGG
       x = F.elu(
-          self.conv_list[l + 2](torch.cat(
-              (x, pos), dim=1), edge_aug, edge_attr) + self.lin_list[l + 3](
-              torch.cat((x, pos), dim=1)),
+          self.conv_list[l + 2](torch.cat((x, pos), dim=1), edge_index,
+                                edge_attr),
           inplace=True)
 
       # # # NO INITIAL AGG
       # x = F.elu(
-      #     self.conv_list[l](torch.cat((x, pos), dim=1), edge_aug, edge_attr),
+      #     self.conv_list[l](torch.cat((x, pos), dim=1), edge_index, edge_attr),
       #     inplace=True)
 
-    x = F.elu(self.conv_list[-1](torch.cat(
-        (x, pos), dim=1), edge_aug, edge_attr) + self.lin_list[-2](
-            torch.cat((x, pos), dim=1)),
-            inplace=True)
-    out = self.lin_list[-1](torch.cat((x, pos), dim=1))
+    out = self.conv_list[-1](torch.cat((x, pos), dim=1), edge_index, edge_attr)
     return out
 
 
@@ -471,90 +416,4 @@ class DBA(nn.Module):
 
     if ret == 1:
       return out, pool_edge_list, pool_pos_list
-    return out
-
-
-class LaplaceLayer(nn.Module):
-
-  def __init__(self, channels, kept_modes: int = 20, device: str = "cpu"):
-    super(LaplaceLayer, self).__init__()
-    self.channels = channels
-    self.kept_modes = kept_modes
-    self.device = device
-
-    self.lin = Linear(channels, channels, bias=False).to(device)
-    self.kernel = Parameter(torch.Tensor(kept_modes, channels,
-                                         channels)).to(device)
-
-    self.reset_parameters()
-
-  def reset_parameters(self):
-    self.lin.reset_parameters()
-    torch.nn.init.normal_(self.kernel)
-
-  def _tensor_op(self, r, v):
-    return torch.sum(r*v)
-
-  def tensor_op(self, R, V):
-    return torch.squeeze(
-        torch.vmap(
-            torch.vmap(self._tensor_op, in_dims=(0, None), out_dims=0),
-            in_dims=(0, 0))(R, V))
-
-  def forward(self, x, phi):
-    v = torch.linalg.pinv(phi) @ x
-    out = F.elu(self.lin(x) + phi @ self.tensor_op(self.kernel, v))
-    return out
-
-
-class LNO(nn.Module):
-
-  def __init__(self,
-               dim,
-               init_data,
-               hidden_channels,
-               out_channels,
-               kept_modes: int = 20,
-               laplace_layers: int = 4,
-               device: str = "cpu") -> None:
-    super(LNO, self).__init__()
-    self.dim = dim
-    self.in_channels = init_data.num_node_features + dim + init_data.y.size(0)
-    self.hidden_channels = hidden_channels
-    self.out_channels = out_channels
-    self.kept_modes = min(kept_modes, init_data.x.size(0))
-    self.laplace_layers = laplace_layers
-    self.device = device
-
-    self.lift = Linear(self.in_channels, hidden_channels).to(device)
-
-    self.lapl_list = nn.ModuleList()
-    for l in range(laplace_layers):
-      self.lapl_list.append(
-          LaplaceLayer(hidden_channels, kept_modes, device).to(device))
-
-    self.lower = Linear(hidden_channels, out_channels).to(device)
-
-    vec_path = os.path.join(os.environ["SCRATCH"],
-                            "ORNL/dimension-bridging/data/processed/eig")
-    self.phi = torch.stack([
-        torch.load(os.path.join(vec_path, "vec_{:d}.pt".format(i))).to(device)
-        for i in range(kept_modes)
-    ],
-                           dim=1)
-
-    self.reset_parameters()
-
-  def reset_parameters(self):
-    self.lift.reset_parameters()
-    self.lower.reset_parameters()
-
-  def forward(self, x, pos, y):
-    x = self.lift(
-        torch.cat((x, pos, y*torch.ones_like(pos).to(self.device)), dim=1))
-
-    for l in range(self.laplace_layers):
-      x = self.lapl_list[l](x, self.phi)
-
-    out = self.lower(x)
     return out

@@ -8,11 +8,13 @@ import argparse
 parser = argparse.ArgumentParser()
 
 parser.add_argument(
-    "--case-name", default="dba-gat-sagp", type=str, help="Architecture Name")
+    "--case-name", default="dba_gkno_sagp", type=str, help="Architecture Name")
 parser.add_argument(
     "--channels", default=10, type=int, help="Aggregation Channels")
 parser.add_argument(
     "--latent-sz", default=10, type=int, help="Latent Space Dimensionality")
+parser.add_argument(
+    "--k-sz", default=3, type=int, help="Kernel k-Hop Neighborhood Size")
 parser.add_argument(
     "--pooling-layers", default=1, type=int, help="Number of Pooling Layers")
 parser.add_argument(
@@ -62,10 +64,10 @@ if wandb_upload:
   test_dataset = PairDataset(data_path, ma_list, [4e6, 7e6, 1e7], aoa_list,
                              "test", n_slices)
 else:
-  # train_dataset = PairDataset(data_path, [0.3, 0.4], [3e6, 4e6], [3, 4],
-  #                             "idev-train", n_slices)
   train_dataset = PairDataset(data_path, [0.3, 0.4], [3e6, 4e6], [3, 4],
-                              "recon", n_slices)
+                              "idev-train", n_slices)
+  # train_dataset = PairDataset(data_path, [0.3, 0.4], [3e6, 4e6], [3, 4],
+  #                             "recon", n_slices)
   test_dataset = PairDataset(data_path, [0.5, 0.6], [5e6, 6e6], [5, 6],
                              "idev-test", n_slices)
 
@@ -82,14 +84,8 @@ test_loader = DataLoader(test_dataset, test_sz, follow_batch=['x_3', 'x_2'])
 init_data = next(iter(test_loader))
 init_data = init_data[0].to(device)
 
-# set kernel size to mean of node degree vector
-idx = init_data.edge_index_3
-sz = init_data.x_3.shape[0]
-con = torch.ones((init_data.num_edges,)).to(device)
-adj = torch.sparse_coo_tensor(idx, con, (sz, sz))
-deg = adj.matmul(torch.ones((sz, 1)).to(device))
-k_size = int(torch.ceil(torch.mean(deg) / 3))
-del idx, sz, adj, deg
+# adjust for k starting at 1
+k_size = args.k_sz - 1
 
 # pr<0.8 for memory
 # pool_ratio = 0.125
@@ -104,8 +100,9 @@ eps = 1e-15
 model = DBA(3, init_data, args.channels, args.latent_sz, k_size,
             args.pooling_layers, pool_ratio, device).to(device)
 opt = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-sch = torch.optim.lr_scheduler.ExponentialLR(opt,args.decay)
-plat = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5)
+sch = torch.optim.lr_scheduler.LinearLR(opt,1,1e-1,1000)
+# sch = torch.optim.lr_scheduler.ExponentialLR(opt,args.decay)
+# plat = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5)
 loss_fn = torch.nn.MSELoss()
 
 save_path = os.path.join(data_path, "models_save", case_name,
@@ -159,9 +156,9 @@ def main(n_epochs):
     lr = sch._last_lr[0]
     loss = train_step()
     test_err = test_step()
-    if lr > 1e-5:
-      sch.step()
-    plat.step(loss)
+    # if lr > 1e-5:
+    sch.step()
+    # plat.step(loss)
 
     if debug:
       print("Loss {:g}, Error {:g}, Epoch {:g}, LR {:g},".format(loss, test_err, epoch, lr))

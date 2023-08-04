@@ -26,10 +26,10 @@ def v2i(mesh):
 
   indices = np.array([connect(edge) for edge in edges])
   indices = np.concatenate(indices, axis=-1)
-  main_diag = np.row_stack((np.arange(n_nodes), np.arange(n_nodes)))
-  indices = np.concatenate((indices, main_diag), axis=-1)
+  # main_diag = np.row_stack((np.arange(n_nodes), np.arange(n_nodes)))
+  # indices = np.concatenate((indices, main_diag), axis=-1)
 
-  data = np.ones((indices.shape[0],))
+  data = np.ones((indices.shape[1],))
 
   return indices, data, n_nodes
 
@@ -48,15 +48,12 @@ def combine(idx_list, dat_list, n_list):
 
 
 if __name__ == "__main__":
-  import argparse
+  # import argparse
 
-  parser = argparse.ArgumentParser()
-  parser.add_argument("--file", "-f", default="slice_0.vtk", type=str)
-  args = parser.parse_args()
+  # parser = argparse.ArgumentParser()
+  # parser.add_argument("--file", "-f", default="slice_0.vtk", type=str)
+  # args = parser.parse_args()
 
-  adj_list = []
-  for s in range(5):
-    fname = "data/ma_0.2/re_1e+08/a_0/slice_{:d}.vtk".format(s)
-    mesh = pv.read(fname)
-    adj_list.append(v2a(mesh))
-  idx, data = combine(adj_list)
+  fname = "../data/ma_0.2/re_2e+06/a_5/flow.vtu"
+  mesh = pv.read(fname)
+  v2i(mesh)
