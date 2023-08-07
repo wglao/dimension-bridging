@@ -85,7 +85,7 @@ init_data = next(iter(test_loader))
 init_data = init_data[0].to(device)
 
 # adjust for k starting at 1
-k_size = args.k_sz - 1
+k_size = args.k_sz
 
 # pr<0.8 for memory
 # pool_ratio = 0.125

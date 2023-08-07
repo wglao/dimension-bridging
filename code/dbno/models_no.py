@@ -45,9 +45,10 @@ def get_edge_aug(edge_index, pos, steps: int = 1, device: str = "cpu"):
   adj = torch.sparse_coo_tensor(edge_index,
                                 torch.ones(edge_index.size(1),).to(device))
   adj_aug = adj
-  for _ in range(steps):
-    adj_aug = (adj_aug @ adj).coalesce()
-  adj_aug = (adj + adj_aug).coalesce()
+  if steps>=1:
+    for _ in range(steps - 1):
+      adj_aug = (adj_aug @ adj).coalesce()
+    adj_aug = (adj + adj_aug).coalesce()
   edge_index_aug = adj_aug.indices()
   edge_attr_aug = get_edge_attr(edge_index_aug, pos)
   return edge_index_aug, edge_attr_aug
