@@ -13,6 +13,7 @@ from torch.nn import ReLU, Sequential
 import torch.nn.functional as F
 from graphdata import PairData
 import numpy as np
+from typing import NamedTuple
 
 
 def get_pooled_sz(full_sz: int, ratio: float, layer: int):
@@ -36,6 +37,19 @@ def get_edge_attr(edge_index, pos):
   #   edge_attr[i] = pos[xs[1]] - pos[xs[0]]
   edge_attr = pos[edge_index[1]] - pos[edge_index[0]]
   return edge_attr
+
+
+def get_edge_aug(edge_index, pos, steps: int = 1, device: str = "cpu"):
+  adj = torch.sparse_coo_tensor(edge_index,
+                                torch.ones(edge_index.size(1),).to(device))
+  adj_aug = adj
+  if steps >= 1:
+    for _ in range(steps - 1):
+      adj_aug = (adj_aug @ adj).coalesce()
+    adj_aug = (adj + adj_aug).coalesce()
+  edge_index_aug = adj_aug.indices()
+  edge_attr_aug = get_edge_attr(edge_index_aug, pos)
+  return edge_index_aug, edge_attr_aug
 
 
 class SAGPoolWithPos(SAGPooling):
@@ -102,6 +116,112 @@ class SAGPoolWithPos(SAGPooling):
     return x, edge_index, pos, edge_attr, batch, perm, score[perm]
 
 
+class Neighborhood():
+
+  def __init__(self, x: torch.Tensor, edge_index: torch.Tensor,
+               pos: torch.Tensor, node_id: int, k: int):
+    self.x = x
+    self.pos = pos
+    self.node_id = node_id
+    self.k = k
+
+    # renumber nodes
+    old_ids = torch.sort(torch.unique(edge_index))
+    self.old_ids = old_ids
+
+    for new, old in enumerate(old_ids):
+      edge_index = torch.where(edge_index == old,
+                               torch.full_like(edge_index, new), edge_index)
+    self.edge_index = edge_index
+
+    self.pool_val = torch.max(x, 0)
+
+
+class NeighborhoodPool(nn.Module):
+
+  def __init__(self,
+               in_channels: int,
+               n_size: int = 8,
+               k_max: int = 5,
+               gnn: nn.Module = GATv2Conv,
+               device: str = "cpu",
+               edge_dim: int = 3,
+               **kwargs) -> None:
+    super(NeighborhoodPool, self).__init__()
+    self.n_size = n_size
+    self.k_max = k_max
+    self.gnn = gnn(
+        in_channels=in_channels, out_channels=1, edge_dim=edge_dim,
+        **kwargs).to(device)
+    self.device = device
+
+  def forward(self, x, edge_index, pos):
+    n_list = []
+    old_edge_index = edge_index
+    # cluster and pool
+    while x.size(0) > 0:
+      edge_attr = get_edge_attr(edge_index, pos)
+      score = softmax(torch.squeeze(self.gnn(x, edge_index, edge_attr)))
+      node_id = torch.argmax(score)
+      k = 1
+      k_hop_nh = torch.unique(edge_index[:, 1][edge_index[:, 0] == node_id])
+      if k_hop_nh.size(0) < self.n_size and k_hop_nh.size(0) < x.size(0):
+        adj = torch.sparse_coo_tensor(
+            edge_index,
+            torch.ones(edge_index.size(1),).to(self.device))
+        adj_aug = adj
+        while k_hop_nh.size(0) < self.n_size and k_hop_nh.size(0) < x.size(
+            0) and k < self.k_max:
+          k += 1
+          adj_aug = (adj_aug @ adj).coalesce()
+          edge_aug = adj_aug.indices()
+          k_hop_nh = torch.unique(edge_aug[:, 1][edge_aug[:, 0] == node_id])
+
+      n_list.append(
+          Neighborhood(x[k_hop_nh], edge_aug[:, edge_aug[:, 0] == node_id],
+                       pos[node_id], len(n_list), k))
+
+      keep_idx = torch.tensor([i not in k_hop_nh for i in range(x.size(0))
+                              ]).to(self.device)
+      x = x[keep_idx, :]
+      pos = pos[keep_idx, :]
+
+      keep_idx = (torch.tensor([i not in k_hop_nh for i in edge_index[:, 0]])
+                  & torch.tensor([i not in k_hop_nh for i in edge_index[:, 1]
+                                 ])).to(self.device)
+      edge_index = edge_index[:, keep_idx]
+      for new, old in enumerate(torch.sort(torch.unique(edge_index))):
+        edge_index = torch.where(edge_index == old,
+                                 torch.full_like(edge_index, new), edge_index)
+
+    # recombine
+    edge_index = old_edge_index
+    x = torch.stack([n.pool_val for n in n_list])
+    pos = torch.stack([n.pos for n in n_list])
+    n_ids = torch.stack([n.node_id for n in n_list])
+
+    # create clustering matrix using n.node_id
+    clusters = torch.concat(
+        [torch.full((n.node_ids.size(0),), n.node_id) for n in n_list])
+    clusters = clusters[torch.concat([n.old_ids for n in n_list])]
+
+    # get edge attr by differencing clustering feature
+    edge_attr = get_edge_attr(edge_index, clusters)
+
+    # non-zero edges get saved to list
+    nz_edges = edge_index[:, torch.argwhere(edge_attr)]
+
+    # re-index clustering with saved edges to get edges of pooled graph
+    pool_edge_index = torch.stack(
+        (clusters[nz_edges[:, 0]], clusters[nz_edges[:, 1]]))
+    pool_edge_index = torch.unique(pool_edge_index, dim=1)
+    for new, old in enumerate(n_ids):
+      pool_edge_index = torch.where(pool_edge_index == old,
+                                    torch.full_like(pool_edge_index, new),
+                                    pool_edge_index)
+
+    return x, pool_edge_index, pos
+
 class Encoder(nn.Module):
 
   def __init__(self,
@@ -135,13 +255,19 @@ class Encoder(nn.Module):
     # pools
     self.pool_list = nn.ModuleList()
     for _ in range(n_pools):
+      # # SAGPOOL
+      # self.pool_list.append(
+      #     SAGPoolWithPos(
+      #         hidden_channels + dim,
+      #         pool_ratio,
+      #         hidden_channels=hidden_channels,
+      #         edge_dim=dim,
+      #         device=self.device).to(self.device))
+
+      # # MY NEIGHBORHOOD POOL
       self.pool_list.append(
-          SAGPoolWithPos(
-              hidden_channels + dim,
-              pool_ratio,
-              hidden_channels=hidden_channels,
-              edge_dim=dim,
-              device=self.device).to(self.device))
+          NeighborhoodPool(hidden_channels + dim, 1 // pool_ratio))
+
       self.conv_list.append(
           GATv2Conv(hidden_channels + dim, hidden_channels,
                     edge_dim=dim).to(self.device))
@@ -168,7 +294,12 @@ class Encoder(nn.Module):
     pool_pos_list = [pos]
     edge_attr_list = [edge_attr]
     for l, pool in enumerate(self.pool_list):
-      x, edge_index, pos, _, _, _, _ = pool(x, edge_index, pos)
+      # # SAGPOOL
+      # x, edge_index, pos, _, _, _, _ = pool(x, edge_index, pos)
+
+      # # MY NEIGHBORHOOD POOL
+      x, edge_index, pos = pool(x, edge_index, pos)
+
       edge_attr = get_edge_attr(edge_index, pos)
 
       pool_edge_list.insert(0, edge_index)
@@ -215,13 +346,19 @@ class StructureEncoder(Encoder):
     # pools
     self.pool_list = nn.ModuleList()
     for _ in range(n_pools):
+      # # SAGPOOL
+      # self.pool_list.append(
+      #     SAGPoolWithPos(
+      #         hidden_channels + dim,
+      #         pool_ratio,
+      #         hidden_channels=hidden_channels,
+      #         edge_dim=dim,
+      #         device=self.device).to(self.device))
+
+      # # MY NEIGHBORHOOD POOL
       self.pool_list.append(
-          SAGPoolWithPos(
-              hidden_channels + dim,
-              pool_ratio,
-              hidden_channels=hidden_channels,
-              edge_dim=dim,
-              device=self.device).to(self.device))
+          NeighborhoodPool(hidden_channels + dim, 1 // pool_ratio))
+      
       self.conv_list.append(
           GATv2Conv(hidden_channels + self.dim, hidden_channels,
                     edge_dim=dim).to(self.device))
@@ -245,7 +382,12 @@ class StructureEncoder(Encoder):
     pool_pos_list = [pos]
     edge_attr_list = [edge_attr]
     for l, pool in enumerate(self.pool_list):
-      x, edge_index, pos, _, _, _, _ = pool(x, edge_index, pos)
+      # # SAGPOOL
+      # x, edge_index, pos, _, _, _, _ = pool(x, edge_index, pos)
+
+      # # MY NEIGHBORHOOD POOL
+      x, edge_index, pos = pool(x, edge_index, pos)
+      
       edge_attr = get_edge_attr(edge_index, pos)
 
       pool_edge_list.insert(0, edge_index)
