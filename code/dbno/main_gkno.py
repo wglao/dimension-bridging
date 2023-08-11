@@ -1,6 +1,7 @@
 import os
 import sys
 import glob
+import math
 from datetime import date
 import shutil
 from functools import partial
@@ -9,14 +10,14 @@ import argparse
 parser = argparse.ArgumentParser()
 
 parser.add_argument(
-    "--case-name", default="dblno", type=str, help="Architecture Name")
+    "--case-name", default="dbgkno", type=str, help="Architecture Name")
 parser.add_argument(
     "--channels", default=10, type=int, help="Aggregation Channels")
 parser.add_argument(
-    "--kept-modes",
-    default=20,
+    "--k-hops",
+    default=5,
     type=int,
-    help="Number of Eigenfunctions to Retain")
+    help="Number of Hops in Neighborhood")
 parser.add_argument(
     "--learning-rate", default=1e-3, type=float, help="Learning Rate")
 parser.add_argument(
@@ -41,7 +42,7 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.data import Data
 from torch_geometric.nn import knn_interpolate
 
-from models_no import LNO, LaplaceLayer
+from models_no import GKNO, GKLayer, GKMLP
 from graphdata import PairData, PairDataset
 
 if debug:
@@ -86,50 +87,6 @@ init_pair = init_pair[0].to(device)
 init_data = Data(
     init_pair.x_3, init_pair.edge_index_3, y=init_pair.y, pos=init_pair.pos_3)
 
-transform_path = os.path.join(os.environ["SCRATCH"],
-                              "ORNL/dimension-bridging/data/processed/eig")
-if not os.path.exists(transform_path):
-  os.makedirs(transform_path, exist_ok=True)
-
-n_eigvecs = len(glob.glob(os.path.join(transform_path, "*.pt")))
-
-if n_eigvecs < args.kept_modes:
-
-  def get_deg(x, edge_index):
-    deg = torch.sparse_coo_tensor(edge_index, torch.ones(
-        (edge_index.size(1),))) @ torch.ones((x.size(0), 1))
-    return deg
-
-  def get_laplacian(x, edge_index):
-    n_nodes = x.size(0)
-    adj = torch.sparse_coo_tensor(edge_index, torch.ones(edge_index.size(1),))
-    deg_idx = torch.stack((torch.arange(n_nodes), torch.arange(n_nodes)), dim=0)
-    deg = torch.squeeze(get_deg(x, edge_index))
-    sqrt_deg = torch.sparse_coo_tensor(deg_idx, 1 / deg, (n_nodes, n_nodes))
-    lapl = (torch.eye(n_nodes).to_sparse_coo() -
-            sqrt_deg @ (adj@sqrt_deg)).coalesce()
-    return lapl
-
-  def get_basis(x, edge_index, kept_modes):
-    lapl = get_laplacian(x, edge_index).to_dense()
-    # # LAPL TOO BIG FOR TORCH EIG
-    # _, eigvec = torch.linalg.eigh(lapl)
-
-    # # USE LOBPCG
-    vals, basis = torch.lobpcg(lapl, kept_modes, niter=-1)
-    breakpoint()
-    return vals, basis
-
-  # move to cpu for memory
-  init_data.cpu().detach()
-  vals, basis = get_basis(init_data.x, init_data.edge_index, args.kept_modes)
-  torch.save(vals, os.path.join(transform_path, "vals.pt"))
-  for i, vec in enumerate(basis.transpose(0, 1)):
-    save = os.path.join(transform_path, "vec_{:d}.pt".format(i))
-    if os.path.exists(save):
-      os.remove(save)
-    torch.save(vec, save)
-
 if debug:
   print('Init')
 
@@ -138,8 +95,8 @@ eps = 1e-15
 
 # 3 DIM: X, Y, Z
 # 5 OUT CHANNELS: RHO, Px, Py, Pz, E
-model = LNO(
-    3, init_data, args.channels, 5, args.kept_modes, device=device).to(device)
+model = GKNO(
+    3, init_data, args.channels, 5, args.k_hops, device=device).to(device)
 opt = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 sch = torch.optim.lr_scheduler.LinearLR(opt,1,1e-1,1000)
 # sch = torch.optim.lr_scheduler.ExponentialLR(opt, args.decay)
@@ -172,7 +129,7 @@ def train_step():
     opt.zero_grad()
     pair_batch = pair_batch.to(device)
     x = interpolate(pair_batch.x_2, pair_batch.pos_2, pair_batch.pos_3)
-    out = model(x, pair_batch.pos_3, pair_batch.y)
+    out = model(x, pair_batch.edge_index_3, pair_batch.pos_3, pair_batch.y)
 
     batch_loss = loss_fn(out, pair_batch.x_3)
     batch_loss.backward()
@@ -190,7 +147,7 @@ def test_step():
     for pair_batch in test_loader:
       pair_batch = pair_batch.to(device)
       x = interpolate(pair_batch.x_2, pair_batch.pos_2, pair_batch.pos_3)
-      out = model(x, pair_batch.pos_3, pair_batch.y)
+      out = model(x, pair_batch.edge_index_3, pair_batch.pos_3, pair_batch.y)
       batch_loss = loss_fn(out, pair_batch.x_3)
       test_err += batch_loss
     test_err /= test_batches
@@ -209,8 +166,8 @@ def main(n_epochs):
     # lr = args.learning_rate
     loss = train_step()
     test_err = test_step()
-    if lr > 1e-5:
-      sch.step()
+    # if lr > 1e-5:
+    sch.step()
     # plat.step(loss)
 
     if debug:
@@ -223,15 +180,26 @@ def main(n_epochs):
             "Error": test_err,
             "Epoch": epoch,
         })
-    if test_err < min_err or epoch == n_epochs - 1:
-      min_err = test_err if test_err < min_err else min_err
-      if epoch < n_epochs - 1 and epoch > 0:
-        old_save = save
-        os.remove(old_save)
-      save = os.path.join(
-          save_path,
-          "model_ep-{:d}_L-{:g}_E-{:g}.pt".format(epoch, loss, test_err))
-      torch.save(model.state_dict(), save)
+    if debug:
+      if loss < min_err or epoch == n_epochs - 1:
+        min_err = test_err if test_err < min_err else min_err
+        if epoch < n_epochs - 1 and epoch > 0:
+          old_save = save
+          os.remove(old_save)
+        save = os.path.join(
+            save_path,
+            "model_ep-{:d}_L-{:g}_E-{:g}.pt".format(epoch, loss, test_err))
+        torch.save(model.state_dict(), save)
+    else:
+      if test_err < min_err or epoch == n_epochs - 1:
+        min_err = test_err if test_err < min_err else min_err
+        if epoch < n_epochs - 1 and epoch > 0:
+          old_save = save
+          os.remove(old_save)
+        save = os.path.join(
+            save_path,
+            "model_ep-{:d}_L-{:g}_E-{:g}.pt".format(epoch, loss, test_err))
+        torch.save(model.state_dict(), save)
 
       # if test_err == min_err:
       #   torch.save((edge_list, pos_list), epl + "_min.pt")

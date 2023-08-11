@@ -8,7 +8,7 @@ import argparse
 parser = argparse.ArgumentParser()
 
 parser.add_argument(
-    "--case-name", default="dba-gat-nhp", type=str, help="Architecture Name")
+    "--case-name", default="dba-kgnn-nhp", type=str, help="Architecture Name")
 parser.add_argument(
     "--channels", default=10, type=int, help="Aggregation Channels")
 parser.add_argument(
@@ -36,11 +36,14 @@ import numpy as np
 import torch
 from torch_geometric import compile
 from torch_geometric.loader import DataLoader
+from torch_geometric.data import Data
+from torch_geometric.nn.pool import avg_pool_neighbor_x
 
-from models_gat_sagp import DBA, Encoder, StructureEncoder, Decoder
+from models_dbae import DBA, Encoder, StructureEncoder, Decoder
 from graphdata import PairData, PairDataset
 
 if debug:
+  # torch.autograd.detect_anomaly(True)
   print('Load')
 
 torch.manual_seed(0)
@@ -101,7 +104,7 @@ eps = 1e-15
 model = DBA(3, init_data, args.channels, args.latent_sz, k_size,
             args.pooling_layers, pool_ratio, device).to(device)
 opt = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-sch = torch.optim.lr_scheduler.LinearLR(opt,1,1e-1,1000)
+sch = torch.optim.lr_scheduler.LinearLR(opt, 1, 1e-2, 1000)
 # sch = torch.optim.lr_scheduler.ExponentialLR(opt,args.decay)
 # plat = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5)
 loss_fn = torch.nn.MSELoss()
@@ -111,6 +114,9 @@ save_path = os.path.join(data_path, "models_save", case_name,
 if not os.path.exists(save_path):
   os.makedirs(save_path)
 
+lambda_2 = 0.1
+lambda_3 = 0.1
+
 
 def train_step():
   model.train()
@@ -118,11 +124,39 @@ def train_step():
   for pair_batch in train_loader:
     opt.zero_grad()
     pair_batch = pair_batch.to(device)
-    out, _, _ = model(pair_batch.x_3, pair_batch.edge_index_3, pair_batch.pos_3,
-                      pair_batch.x_2, pair_batch.edge_index_2, pair_batch.pos_2,
-                      pair_batch.y)
+    out, pool_edge_list_2, pool_edge_list_3, _, score_list_2, score_list_3, pos_std_list_2, pos_std_list_3 = model(
+        pair_batch.x_3, pair_batch.edge_index_3, pair_batch.pos_3,
+        pair_batch.x_2, pair_batch.edge_index_2, pair_batch.pos_2, pair_batch.y)
 
-    batch_loss = loss_fn(out, pair_batch.x_3)
+    pool_edge_list_2.insert(0, pair_batch.edge_index_2)
+    pool_edge_list_3.insert(0, pair_batch.edge_index_3)
+
+    score_diff_2 = [
+        score_2 - avg_pool_neighbor_x(Data(score_2, pool_edge)).x
+        for score_2, pool_edge in zip(score_list_2, pool_edge_list_2)
+    ]
+    score_diff_3 = [
+        score_3 - avg_pool_neighbor_x(Data(score_3, pool_edge)).x
+        for score_3, pool_edge in zip(score_list_3, pool_edge_list_3)
+    ]
+    loss_score_2 = sum([
+        loss_fn(score_diff, torch.zeros_like(score_diff))
+        for score_diff in score_diff_2
+    ])
+    loss_score_3 = sum([
+        loss_fn(score_diff, torch.zeros_like(score_diff))
+        for score_diff in score_diff_3
+    ])
+
+    score_range_2 = sum([((score_2.max() - score_2.min()) - 10).square()
+                         for score_2 in score_list_2])
+    score_range_3 = sum([((score_3.max() - score_3.min()) - 10).square()
+                         for score_3 in score_list_3])
+
+    batch_loss = loss_fn(
+        out, pair_batch.x_3
+    ) + lambda_2*loss_score_2 + lambda_2*score_range_2 + lambda_3*loss_score_3 + lambda_3*score_range_3
+    breakpoint()
     batch_loss.backward()
     opt.step()
 
@@ -135,7 +169,7 @@ def test_step():
   model.eval()
   with torch.no_grad():
     test_err = 0
-    for pair_batch in test_loader:
+    for pair_batch in train_loader:
       pair_batch = pair_batch.to(device)
       out, _, _ = model(pair_batch.x_3, pair_batch.edge_index_3,
                         pair_batch.pos_3, pair_batch.x_2,
@@ -149,7 +183,6 @@ def test_step():
 def main(n_epochs):
   min_err = torch.inf
   save = os.path.join(save_path, "model_init")
-  epl = os.path.join(save_path, "epl")
   # indices = train_dataset.items
   if debug:
     print('Train')
@@ -160,7 +193,8 @@ def main(n_epochs):
     sch.step()
 
     if debug:
-      print("Loss {:g}, Error {:g}, Epoch {:g}, LR {:g},".format(loss, test_err, epoch, lr))
+      print("Loss {:g}, Error {:g}, Epoch {:g}, LR {:g},".format(
+          loss, test_err, epoch, lr))
     if epoch % 100 == 0 or epoch == n_epochs - 1:
       if wandb_upload:
         wandb.log({
@@ -177,11 +211,6 @@ def main(n_epochs):
           save_path,
           "model_ep-{:d}_L-{:g}_E-{:g}.pt".format(epoch, loss, test_err))
       torch.save(model.state_dict(), save)
-
-      # if test_err == min_err:
-      #   torch.save((edge_list, pos_list), epl + "_min.pt")
-      # else:
-      #   torch.save((edge_list, pos_list), epl + "_final.pt")
 
 
 if __name__ == "__main__":
