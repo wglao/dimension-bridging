@@ -5,11 +5,11 @@ from typing import Tuple, Union, Optional, Callable
 from torch import nn
 from torch_geometric.data import Batch, Data
 from torch_geometric.loader import ClusterData, ClusterLoader
-from torch_geometric.nn import SAGEConv, SAGPooling, GATv2Conv, GraphConv, GINConv, PNAConv, knn_interpolate
+from torch_geometric.nn import SAGEConv, SAGPooling, GATv2Conv, GraphConv, GCNConv, GINConv, PNAConv, knn_interpolate
 from torch_geometric.nn.norm import BatchNorm
 from torch_geometric.nn import Sequential as GeoSequential
 from torch_geometric.nn.pool.topk_pool import filter_adj, topk
-from torch_geometric.utils import softmax
+from torch_geometric.utils import softmax, add_self_loops, add_remaining_self_loops
 from torch.nn import Linear, ReLU, Sequential
 import torch.nn.functional as F
 from graphdata import PairData
@@ -33,6 +33,18 @@ def get_deg(x, edge_index, device: str = "cpu"):
 def get_edge_attr(edge_index, pos):
   edge_attr = pos[edge_index[1]] - pos[edge_index[0]]
   return edge_attr
+
+def get_edge_aug(edge_index, pos, steps: int = 1, device: str = "cpu"):
+  adj = torch.sparse_coo_tensor(edge_index,
+                                torch.ones(edge_index.size(1),).to(device))
+  adj_aug = adj
+  if steps >= 1:
+    for _ in range(steps - 1):
+      adj_aug = (adj_aug @ adj).coalesce()
+    adj_aug = (adj + adj_aug).coalesce()
+  edge_index_aug = adj_aug.indices()
+  edge_attr_aug = get_edge_attr(edge_index_aug, pos)
+  return edge_index_aug, edge_attr_aug
 
 
 class MLP(nn.Module):
@@ -337,9 +349,9 @@ class RDB(nn.Module):
     self.bnorms.append(BatchNorm(in_channels).to(device))
 
   def forward(self, x, edge_index):
-    x1 = F.elu(self.bnorms[0](self.conv1(x, edge_index)))
-    x2 = F.elu(self.bnorms[1](self.conv2(torch.cat((x, x1), 1), edge_index)))
-    x3 = F.elu(self.bnorms[2](self.conv3(torch.cat((x, x1, x2), 1),
+    x1 = F.selu(self.bnorms[0](self.conv1(x, edge_index)))
+    x2 = F.selu(self.bnorms[1](self.conv2(torch.cat((x, x1), 1), edge_index)))
+    x3 = F.selu(self.bnorms[2](self.conv3(torch.cat((x, x1, x2), 1),
                                          edge_index)))
     out = x + 0.2*x3
     return out
@@ -368,139 +380,84 @@ class ERDB(nn.Module):
     return out
 
 
-class Neighborhood():
-
-  def __init__(self, x: torch.Tensor, edge_index: torch.Tensor,
-               old_ids: torch.Tensor, pos: torch.Tensor, node_id: int, k: int):
-    self.x = x
-    self.pos = pos
-    self.node_id = node_id
-    self.k = k
-    self.old_ids = old_ids
-
-    # renumber nodes
-    for new, old in enumerate(torch.unique(edge_index)):
-      edge_index = torch.where(edge_index == old,
-                               torch.full_like(edge_index, new), edge_index)
-    self.edge_index = edge_index
-
-    self.pool_val, _ = torch.max(x, 0)
-
-
 class NeighborhoodPool(nn.Module):
 
   def __init__(self,
-               in_channels: int,
-               n_size: int = 8,
-               k_max: int = 5,
-               gnn: nn.Module = GATv2Conv,
+               dim: int,
+               hidden_channels: int,
+               k_hops: int = 1,
+               gnn: nn.Module = GCNConv,
                device: str = "cpu",
-               edge_dim: int = 3,
                **kwargs) -> None:
     super(NeighborhoodPool, self).__init__()
-    self.n_size = n_size
-    self.k_max = k_max
-    self.gnn = gnn(
-        in_channels=in_channels, out_channels=1, edge_dim=edge_dim,
-        **kwargs).to(device)
+    self.dim = dim
+    self.k_hops = k_hops
+    self.gnn1 = gnn(in_channels=dim, out_channels=hidden_channels, **kwargs).to(device)
+    self.gnn2 = gnn(
+        in_channels=hidden_channels, out_channels=1, **kwargs).to(device)
     self.device = device
 
   def forward(self, x, edge_index, pos):
-    n_list = []
-    old_edge_index = edge_index
-    old_ids = torch.arange(x.size(0)).to(self.device)
-    edge_attr = get_edge_attr(edge_index, pos)
-    score = torch.squeeze(
-        self.gnn(torch.cat((x, pos), dim=1), edge_index, edge_attr))
-    deg = get_deg(x, edge_index, self.device)
-    k_hops = min(
-        int(-(math.log(self.n_size) // -math.log(min(deg)))), self.k_max)
-    # cluster and pool
-    while x.size(0) > 0:
-      node_id = torch.argmax(score)
+    edge_aug = add_remaining_self_loops(
+        get_edge_aug(edge_index, pos, self.k_hops, self.device)[0])[0]
+    score = F.selu(self.gnn1(pos, edge_aug))
+    score = self.gnn2(score, edge_aug)
 
-      # if node is connected
-      if node_id in edge_index:
-        adj = torch.sparse_coo_tensor(
-            edge_index,
-            torch.ones(edge_index.size(1),).to(self.device))
-        adj_aug = adj
-        for k in range(k_hops):
-          adj_aug = (adj_aug @ adj).coalesce()
-        edge_aug = adj_aug.indices()
-        k_hop_nh = torch.unique(edge_aug[1, :][edge_aug[0, :] == node_id])
-        pool_idx = (torch.tensor([i in k_hop_nh for i in edge_index[0, :]])
-                    & torch.tensor([i in k_hop_nh for i in edge_index[1, :]
-                                   ])).to(self.device)
-        pool_edge_index = edge_index[:, pool_idx]
-      # else node is isolated
+    new_order = torch.squeeze(torch.argsort(score, 0))
+    old_order = torch.squeeze(torch.argsort(new_order, 0))
+    order = new_order
+
+    # reorder nodes
+    # x = x[new_order]
+    # pos = pos[new_order]
+    # for new, old in zip(new_order, old_order):
+    #   tmp = torch.argwhere(edge_aug == old)
+    #   edge_aug = torch.where(tmp, torch.full_like(edge_aug, new), edge_aug)
+    #   edge_pool = torch.where(tmp, torch.full_like(edge_pool, new), edge_pool)
+
+    # remove edges and cluster
+    x_pool = None
+    pos_pool = None
+    n_mask_0 = torch.ones((x.size(0),)).bool().to(self.device)
+
+    cluster = torch.zeros((x.size(0),)).to(self.device)
+    n = 0
+    while True:
+      node = order[0]
+      e_mask_1 = edge_aug[0] == node
+
+      n_mask_1 = torch.zeros((x.size(0),)).bool().to(self.device)
+      n_mask_1[edge_aug[1, e_mask_1]] = 1
+      n_mask_0 = n_mask_0 & ~n_mask_1
+
+      cluster[n_mask_1] = n
+
+      if x_pool is None:
+        x_pool = torch.unsqueeze(torch.max(x[n_mask_1], dim=0).values, 0)
+        pos_pool = torch.unsqueeze(pos[node], 0)
       else:
-        k_hop_nh = torch.tensor([node_id]).to(self.device)
-        pool_edge_index = torch.tile(k_hop_nh, (2, 1))
-      n_list.append(
-          Neighborhood(x[k_hop_nh], pool_edge_index, old_ids[k_hop_nh],
-                       pos[node_id], len(n_list), k_hops))
-      keep_idx = torch.tensor([i not in k_hop_nh for i in range(x.size(0))
-                              ]).to(self.device)
+        x_pool = torch.cat(
+            (x_pool, torch.unsqueeze(torch.max(x[n_mask_1], dim=0).values, 0)))
+        pos_pool = torch.cat((pos_pool, torch.unsqueeze(pos[node], dim=0)))
 
-      if keep_idx.size(0) == 0:
+      edge_aug = edge_aug[:, ~(
+          edge_aug.ravel().unsqueeze(1) == n_mask_1.argwhere().squeeze()
+      ).sum(1).reshape(edge_aug.shape).sum(0).bool()]
+      order = new_order[n_mask_0[new_order]]
+
+      n += 1
+
+      if order.size(0) == 0:
         break
 
-      score = score[keep_idx]
-      x = x[keep_idx, :]
-      pos = pos[keep_idx, :]
-      old_ids = old_ids[keep_idx]
+    edge_attr = get_edge_attr(edge_index, cluster)
+    edge_index = edge_index[:, edge_attr.bool()]
+    edge_pool = cluster[edge_index]
+    edge_pool = edge_pool.unique(dim=1).int()
 
-      # remove edge if a connecting node has been pooled
-      keep_idx = (
-          torch.tensor([i not in k_hop_nh for i in edge_index[0, :]]).to(
-              self.device)
-          & torch.tensor([i not in k_hop_nh for i in edge_index[1, :]]).to(
-              self.device))
-
-      if keep_idx.sum() > 0:
-        edge_index = edge_index[:, keep_idx]
-        for new, old in enumerate(torch.unique(edge_index)):
-          edge_index = torch.where(edge_index == old,
-                                   torch.full_like(edge_index, new), edge_index)
-      # if remaining nodes are isolated, pool as one neighborhood
-      else:
-        edge_index = torch.tile(torch.arange(x.size(0)).to(self.device), (2, 1))
-        n_list.append(
-            Neighborhood(x, edge_index, old_ids, pos[torch.argmax(score)],
-                         len(n_list), k_hops))
-        break
-
-    # TODO:streamline and fix this
-
-    # recombine
-    edge_index = old_edge_index
-    x = torch.stack([n.pool_val for n in n_list])
-    pos = torch.stack([n.pos for n in n_list])
-    n_ids = torch.tensor([n.node_id for n in n_list])
-
-    # create clustering matrix using n.node_id
-    clusters = torch.concat([
-        torch.full((n.old_ids.size(0),), n.node_id) for n in n_list
-    ]).to(self.device)
-    clusters = clusters[torch.concat([n.old_ids for n in n_list])]
-
-    # get edge attr by differencing clustering feature
-    edge_attr = get_edge_attr(edge_index, clusters)
-
-    # non-zero edges get saved to list
-    nz_edges = edge_index[:, torch.argwhere(edge_attr)]
-
-    # re-index clustering with saved edges to get edges of pooled graph
-    pool_edge_index = torch.stack(
-        (clusters[nz_edges[0, :]], clusters[nz_edges[1, :]]))
-    pool_edge_index = torch.unique(pool_edge_index, dim=1)
-    for new, old in enumerate(n_ids):
-      pool_edge_index = torch.where(pool_edge_index == old,
-                                    torch.full_like(pool_edge_index, new),
-                                    pool_edge_index)
-
-    return x, pool_edge_index, pos
+    if self.training:
+      return x_pool, edge_pool, pos_pool, score
+    return x_pool, edge_pool, pos_pool
 
 
 class StructureEncoder(nn.Module):
@@ -567,10 +524,10 @@ class StructureEncoder(nn.Module):
   def forward(self, x, edge_index, pos):
     x = get_deg(x, edge_index, self.device)
     edge_attr = get_edge_attr(edge_index, pos)
-    x = F.elu(
+    x = F.selu(
         self.conv_list[0](torch.cat((x, pos), dim=1), edge_index, edge_attr),
         inplace=True)
-    x = F.elu(
+    x = F.selu(
         self.conv_list[1](torch.cat((x, pos), dim=1), edge_index, edge_attr),
         inplace=True)
 
@@ -590,7 +547,7 @@ class StructureEncoder(nn.Module):
       pool_pos_list.insert(0, pos)
       edge_attr_list.insert(0, edge_attr)
 
-      x = F.elu(
+      x = F.selu(
           self.conv_list[l + 2](torch.cat((x, pos), dim=1), edge_index,
                                 edge_attr),
           inplace=True)
@@ -612,18 +569,16 @@ class DBGSR(nn.Module):
 
     self.conv1 = GraphConv(self.in_features + dim + 3,
                            hidden_channels).to(device)
+    self.conv2 = GraphConv(hidden_channels, hidden_channels).to(device)
+    self.conv3 = GraphConv(hidden_channels, hidden_channels).to(device)
+    # upsample
+    self.conv4 = GraphConv(hidden_channels, hidden_channels).to(device)
     self.erdb1 = ERDB(dim, hidden_channels, -(hidden_channels // -2),
                       device).to(device)
     self.erdb2 = ERDB(dim, hidden_channels, -(hidden_channels // -2),
                       device).to(device)
-    self.conv2 = GraphConv(hidden_channels, hidden_channels).to(device)
 
-    # upsample
-    self.conv3 = GraphConv(hidden_channels, hidden_channels).to(device)
-    self.conv4 = GraphConv(hidden_channels, hidden_channels).to(device)
     self.conv5 = GraphConv(hidden_channels, self.in_features).to(device)
-
-    self.bnorms = nn.ModuleList([BatchNorm(hidden_channels) for i in range(4)])
 
   def onera_transform(self, pos):
     # adjust x to move leading edge to x=0
@@ -639,17 +594,17 @@ class DBGSR(nn.Module):
         f, self.onera_transform(pos_x), self.onera_transform(pos_y), k=1)
 
   def forward(self, x, edge_index_2, edge_index_3, pos_2, pos_3, y):
-    x1 = self.bnorms[0](
-        self.conv1(
-            torch.cat((x, pos_2, y*torch.ones_like(pos_2)), 1), edge_index_2))
-    x2 = self.erdb1(x1, edge_index_2)
-    x3 = x1 + 0.2*self.erdb2(x2, edge_index_2)
-    x = F.elu(self.bnorms[1](self.conv2(x3, edge_index_2)), inplace=True)
+    x = F.selu(self.conv1(
+            torch.cat((x, pos_2, y*torch.ones_like(pos_2)), 1), edge_index_2), inplace=True)
+    x = F.selu(self.conv2(x, edge_index_2), inplace=True)
 
     # upsample
-    x = self.onera_interp(x3, pos_2, pos_3)
-    x = F.elu(self.bnorms[2](self.conv3(x, edge_index_3)), inplace=True)
-    x = F.elu(self.bnorms[3](self.conv4(x, edge_index_3)), inplace=True)
+    x = self.onera_interp(x, pos_2, pos_3)
+    
+    x1 = F.selu(self.conv3(x, edge_index_3), inplace=True)
+    x2 = self.erdb1(x1, edge_index_2)
+    x = x1 + 0.2*self.erdb2(x2, edge_index_2)
+    x = F.selu(self.conv4(x, edge_index_3), inplace=True)
 
     out = self.conv5(x, edge_index_3)
     return out

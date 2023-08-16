@@ -8,7 +8,7 @@ import argparse
 parser = argparse.ArgumentParser()
 
 parser.add_argument(
-    "--case-name", default="dba-kgnn-nhp", type=str, help="Architecture Name")
+    "--case-name", default="dba-gcn-nbhp", type=str, help="Architecture Name")
 parser.add_argument(
     "--channels", default=10, type=int, help="Aggregation Channels")
 parser.add_argument(
@@ -16,7 +16,7 @@ parser.add_argument(
 parser.add_argument(
     "--pooling-layers", default=1, type=int, help="Number of Pooling Layers")
 parser.add_argument(
-    "--pooling-ratio", default=0.125, type=float, help="Pooling Ratio")
+    "--k-hops", default=1, type=int, help="Pooling Neighborhood Span Distance")
 parser.add_argument(
     "--learning-rate", default=1e-3, type=float, help="Learning Rate")
 parser.add_argument("--wandb", default=0, type=int, help="wandb upload")
@@ -31,6 +31,8 @@ case_name = "_".join([
     str(key) + "-" + str(value) for key, value in list(vars(args).items())[:-2]
 ])[10:]
 device = "cuda:{:d}".format(args.gpu_id) if args.gpu_id >= 0 else "cpu"
+# device = "cuda:{:d}".format(2*args.gpu_id) if args.gpu_id >= 0 else "cpu"
+# device_2 = "cuda:{:d}".format(2*args.gpu_id + 1) if args.gpu_id >= 0 else "cpu"
 
 import numpy as np
 import torch
@@ -38,6 +40,7 @@ from torch_geometric import compile
 from torch_geometric.loader import DataLoader
 from torch_geometric.data import Data
 from torch_geometric.nn.pool import avg_pool_neighbor_x
+import torch.nn.functional as F
 
 from models_dbae import DBA, Encoder, StructureEncoder, Decoder
 from graphdata import PairData, PairDataset
@@ -64,10 +67,12 @@ if wandb_upload:
   test_dataset = PairDataset(data_path, ma_list, [4e6, 7e6, 1e7], aoa_list,
                              "test", n_slices)
 else:
-  train_dataset = PairDataset(data_path, [0.3, 0.4], [3e6, 4e6], [3, 4],
-                              "idev-train", n_slices)
-  test_dataset = PairDataset(data_path, [0.5, 0.6], [5e6, 6e6], [5, 6],
-                             "idev-test", n_slices)
+  # train_dataset = PairDataset(data_path, [0.3, 0.4], [3e6, 4e6], [3, 4],
+  #                             "idev-train", n_slices)
+  # test_dataset = PairDataset(data_path, [0.5, 0.6], [5e6, 6e6], [5, 6],
+  #                            "idev-test", n_slices)
+  train_dataset = PairDataset(data_path, [0.3], [3e6], [3], "recon", n_slices)
+  test_dataset = PairDataset(data_path, [0.3], [3e6], [3], "recon", n_slices)
 
 n_samples = len(train_dataset)
 batch_sz = int(np.min(np.array([1, n_samples])))
@@ -82,18 +87,7 @@ test_loader = DataLoader(test_dataset, test_sz, follow_batch=['x_3', 'x_2'])
 init_data = next(iter(test_loader))
 init_data = init_data[0].to(device)
 
-# set kernel size to mean of node degree vector
-idx = init_data.edge_index_3
-sz = init_data.x_3.shape[0]
-con = torch.ones((init_data.num_edges,)).to(device)
-adj = torch.sparse_coo_tensor(idx, con, (sz, sz))
-deg = adj.matmul(torch.ones((sz, 1)).to(device))
-k_size = int(torch.ceil(torch.mean(deg) / 3))
-del idx, sz, adj, deg
-
-# pr<0.8 for memory
-# pool_ratio = 0.125
-pool_ratio = args.pooling_ratio
+k_hops = args.k_hops
 
 if debug:
   print('Init')
@@ -101,8 +95,8 @@ if debug:
 n_epochs = 10000
 eps = 1e-15
 
-model = DBA(3, init_data, args.channels, args.latent_sz, k_size,
-            args.pooling_layers, pool_ratio, device).to(device)
+model = DBA(3, init_data, args.channels, args.latent_sz, args.pooling_layers,
+            k_hops, device).to(device)
 opt = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 sch = torch.optim.lr_scheduler.LinearLR(opt, 1, 1e-2, 1000)
 # sch = torch.optim.lr_scheduler.ExponentialLR(opt,args.decay)
@@ -118,51 +112,50 @@ lambda_2 = 0.1
 lambda_3 = 0.1
 
 
+def get_edge_attr(edge_index, pos):
+  edge_attr = pos[edge_index[1]] - pos[edge_index[0]]
+  return edge_attr
+
+
 def train_step():
   model.train()
   loss = 0
+  err = 0
   for pair_batch in train_loader:
     opt.zero_grad()
     pair_batch = pair_batch.to(device)
-    out, pool_edge_list_2, pool_edge_list_3, _, score_list_2, score_list_3, pos_std_list_2, pos_std_list_3 = model(
+    out, pool_edge_list_2, pool_edge_list_3, _, _, score_list_2, score_list_3 = model(
         pair_batch.x_3, pair_batch.edge_index_3, pair_batch.pos_3,
         pair_batch.x_2, pair_batch.edge_index_2, pair_batch.pos_2, pair_batch.y)
 
-    pool_edge_list_2.insert(0, pair_batch.edge_index_2)
-    pool_edge_list_3.insert(0, pair_batch.edge_index_3)
+    data_loss = loss_fn(out, pair_batch.x_3)
 
-    score_diff_2 = [
-        score_2 - avg_pool_neighbor_x(Data(score_2, pool_edge)).x
-        for score_2, pool_edge in zip(score_list_2, pool_edge_list_2)
-    ]
-    score_diff_3 = [
-        score_3 - avg_pool_neighbor_x(Data(score_3, pool_edge)).x
-        for score_3, pool_edge in zip(score_list_3, pool_edge_list_3)
-    ]
-    loss_score_2 = sum([
-        loss_fn(score_diff, torch.zeros_like(score_diff))
-        for score_diff in score_diff_2
-    ])
-    loss_score_3 = sum([
-        loss_fn(score_diff, torch.zeros_like(score_diff))
-        for score_diff in score_diff_3
+    score_loss_2 = sum([
+        F.selu(-get_edge_attr(edge_index_2, score_2).square(),
+               inplace=True).sum()
+        for score_2, edge_index_2 in zip(score_list_2, pool_edge_list_2[:-1])
     ])
 
-    score_range_2 = sum([((score_2.max() - score_2.min()) - 10).square()
-                         for score_2 in score_list_2])
-    score_range_3 = sum([((score_3.max() - score_3.min()) - 10).square()
-                         for score_3 in score_list_3])
+    score_loss_3 = sum([
+        F.selu(-get_edge_attr(edge_index_3, score_3).square(),
+               inplace=True).sum()
+        for score_3, edge_index_3 in zip(score_list_3, pool_edge_list_3[:-1])
+    ])
 
-    batch_loss = loss_fn(
-        out, pair_batch.x_3
-    ) + lambda_2*loss_score_2 + lambda_2*score_range_2 + lambda_3*loss_score_3 + lambda_3*score_range_3
-    breakpoint()
+    batch_loss = data_loss + lambda_2*score_loss_2 + lambda_3*score_loss_3
+
     batch_loss.backward()
+    # print(batch_loss)
+    # print(sum([score_2.max() - score_2.min() for score_2 in score_list_2]))
+    # print(sum([score_3.max() - score_3.min() for score_3 in score_list_3]))
+
     opt.step()
 
     loss += batch_loss
+    err += data_loss
   loss /= batches
-  return loss
+  err /= batches
+  return loss, err
 
 
 def test_step():
@@ -188,18 +181,19 @@ def main(n_epochs):
     print('Train')
   for epoch in range(n_epochs):
     lr = sch._last_lr[0]
-    loss = train_step()
+    loss, train_err = train_step()
     test_err = test_step()
     sch.step()
 
     if debug:
-      print("Loss {:g}, Error {:g}, Epoch {:g}, LR {:g},".format(
-          loss, test_err, epoch, lr))
-    if epoch % 100 == 0 or epoch == n_epochs - 1:
+      print("Loss {:g}, Error {:g} / {:g}, Epoch {:g}, LR {:g},".format(
+          loss, train_err, test_err, epoch, lr))
+    if epoch % 10 == 0 or epoch == n_epochs - 1:
       if wandb_upload:
         wandb.log({
             "Loss": loss,
-            "Error": test_err,
+            "Train Error": train_err,
+            "Test Error": test_err,
             "Epoch": epoch,
         })
     if test_err < min_err or epoch == n_epochs - 1:
