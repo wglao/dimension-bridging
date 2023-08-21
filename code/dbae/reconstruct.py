@@ -25,13 +25,13 @@ parser.add_argument(
     "--learning-rate", default=1e-3, type=float, help="Learning Rate")
 parser.add_argument("--wandb", default=1, type=int, help="wandb upload")
 parser.add_argument('--gpu-id', default=0, type=int, help="GPU index")
-parser.add_argument("--mach", default=0.8395, type=float, help="Mach Number")
+parser.add_argument("--mach", default=0.3, type=float, help="Mach Number")
 parser.add_argument(
-    "--reynolds", default=1.172e7, type=float, help="Reynolds Number")
-parser.add_argument("--aoa", default=3.06, type=float, help="Angle of Attack")
+    "--reynolds", default=3e6, type=float, help="Reynolds Number")
+parser.add_argument("--aoa", default=3., type=float, help="Angle of Attack")
 parser.add_argument(
-    "--date", default="010823", type=str, help="Date of run in ddmmyy")
-parser.add_argument("--epoch", default=100, type=int, help="Checkpoint Epoch")
+    "--date", default="180823", type=str, help="Date of run in ddmmyy")
+parser.add_argument("--epoch", default=811, type=int, help="Checkpoint Epoch")
 
 args = parser.parse_args()
 case_name = "_".join([
@@ -74,7 +74,6 @@ def main(save_path):
   save = glob.glob(
       os.path.join(run_path, "model_ep-{:d}*.pt".format(args.epoch)))
   save = save[0] if save != [] else None
-  epl = None
   if save is not None:
     state_dict = torch.load(save)
     model.load_state_dict(state_dict)

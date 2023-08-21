@@ -1,16 +1,30 @@
 import torch
 from torch import Tensor
-from torch_geometric.typing import OptTensor
+from torch_geometric.typing import (
+    Adj,
+    OptPairTensor,
+    OptTensor,
+    SparseTensor,
+    torch_sparse,
+)
 from typing import Tuple, Union, Optional, Callable
 from torch import nn
 from torch_geometric.data import Batch, Data
 from torch_geometric.loader import ClusterData, ClusterLoader
-from torch_geometric.nn import SAGEConv, SAGPooling, GATv2Conv, GraphConv, GCNConv, GINConv, PNAConv, knn_interpolate
+from torch_geometric.nn import SAGEConv, SAGPooling, GATv2Conv, GraphConv, GCNConv, GINConv, MessagePassing, PNAConv, knn_interpolate, Linear
 from torch_geometric.nn.norm import BatchNorm
 from torch_geometric.nn import Sequential as GeoSequential
 from torch_geometric.nn.pool.topk_pool import filter_adj, topk
 from torch_geometric.utils import softmax, add_self_loops, add_remaining_self_loops
-from torch.nn import Linear, ReLU, Sequential
+from torch_geometric.utils import (
+    is_torch_sparse_tensor,
+    scatter,
+    spmm,
+    to_edge_index,
+)
+from torch_geometric.nn.inits import zeros
+from torch.nn import Parameter
+from torch.nn import ReLU, Sequential
 import torch.nn.functional as F
 from graphdata import PairData
 import numpy as np
@@ -33,6 +47,7 @@ def get_deg(x, edge_index, device: str = "cpu"):
 def get_edge_attr(edge_index, pos):
   edge_attr = pos[edge_index[1]] - pos[edge_index[0]]
   return edge_attr
+
 
 def get_edge_aug(edge_index, pos, steps: int = 1, device: str = "cpu"):
   adj = torch.sparse_coo_tensor(edge_index,
@@ -98,6 +113,90 @@ class SAGPGIN(nn.Module):
   def forward(self, x, edge_index, edge_weight=None, size=None):
     out = self.gin(x, edge_index, size)
     return out
+
+
+class KernelMLP(nn.Module):
+
+  def __init__(self,
+               dim: int,
+               hidden_channels: int,
+               device: str = "cpu") -> None:
+    super(KernelMLP, self).__init__()
+    self.dim = dim
+    self.hidden_channels = hidden_channels
+    self.device = device
+
+    self.lin0 = Linear(
+        dim, hidden_channels, weight_initializer='glorot').to(device)
+    self.lin1 = Linear(
+        hidden_channels, hidden_channels,
+        weight_initializer='glorot').to(device)
+    self.lin2 = Linear(
+        hidden_channels, 1, weight_initializer='glorot').to(device)
+
+    self.reset_parameters()
+
+  def reset_parameters(self):
+    self.lin0.reset_parameters()
+    self.lin1.reset_parameters()
+    self.lin2.reset_parameters()
+
+  def forward(self, rel_pos):
+    out = F.selu(self.lin0(rel_pos), inplace=True)
+    out = F.selu(self.lin1(out), inplace=True)
+    out = self.lin2(out)
+    return out
+
+
+class GraphKernelConv(MessagePassing):
+
+  def __init__(self,
+               dim: int,
+               in_channels: int,
+               hidden_channels: int,
+               out_channels: int,
+               k_net: nn.Module = KernelMLP,
+               device: str = "cpu",
+               **kwargs):
+    kwargs.setdefault('aggr', 'add')
+    super(GraphKernelConv, self).__init__()
+    self.dim = dim
+    self.in_channels = in_channels
+    self.hidden_channels = hidden_channels
+    self.out_channels = out_channels
+    self.device = device
+
+    self.k_net = k_net(dim, hidden_channels, device).to(device)
+    self.lin0 = Linear(in_channels, hidden_channels).to(device)
+    self.lin1 = Linear(hidden_channels, out_channels).to(device)
+
+    self.bias = Parameter(torch.Tensor(out_channels)).to(device)
+
+    self.reset_parameters()
+
+  def reset_parameters(self):
+    super().reset_parameters()
+    self.k_net.reset_parameters()
+    self.lin0.reset_parameters()
+    self.lin1.reset_parameters()
+    zeros(self.bias)
+    self._cached_edge_index = None
+
+  def forward(self, x, edge_index, pos):
+    x = F.selu(self.lin0(x), inplace=True)
+    edge_index, _ = add_remaining_self_loops(edge_index)
+    edge_weight = self.k_net(get_edge_attr(edge_index, pos))
+
+    out = self.propagate(edge_index, x=x, edge_weight=edge_weight, size=None)
+    out = self.lin1(out)
+
+    return out
+
+  def message(self, x_j: Tensor, edge_weight: OptTensor) -> Tensor:
+    return x_j if edge_weight is None else edge_weight.view(-1, 1)*x_j
+
+  def message_and_aggregate(self, adj_t: SparseTensor, x: Tensor) -> Tensor:
+    return spmm(adj_t, x, reduce=self.aggr)
 
 
 class SAGPoolWithPos(SAGPooling):
@@ -331,29 +430,44 @@ class RDB(nn.Module):
                dim: int,
                in_channels: int,
                growth_channels: int,
-               device: str = "cpu") -> None:
+               device: str = "cpu",
+               beta: float = 0.2) -> None:
     super(RDB, self).__init__()
     self.dim = dim
     self.in_channels = in_channels
     self.growth_channels = growth_channels
     self.device = device
+    self.beta = beta
 
-    self.conv1 = GraphConv(in_channels, growth_channels)
-    self.conv2 = GraphConv(in_channels + growth_channels,
-                           growth_channels).to(device)
-    self.conv3 = GraphConv(in_channels + 2*growth_channels,
-                           in_channels).to(device)
+    self.conv1 = GraphKernelConv(
+        dim, in_channels, in_channels, growth_channels,
+        device=device).to(device)
+    self.conv2 = GraphKernelConv(
+        dim,
+        in_channels + growth_channels,
+        in_channels,
+        growth_channels,
+        device=device).to(device)
+    self.conv3 = GraphKernelConv(
+        dim,
+        in_channels + 2*growth_channels,
+        in_channels,
+        in_channels,
+        device=device).to(device)
 
-    self.bnorms = nn.ModuleList(
-        [BatchNorm(growth_channels).to(device) for i in range(2)])
-    self.bnorms.append(BatchNorm(in_channels).to(device))
+    self.reset_parameters()
 
-  def forward(self, x, edge_index):
-    x1 = F.selu(self.bnorms[0](self.conv1(x, edge_index)))
-    x2 = F.selu(self.bnorms[1](self.conv2(torch.cat((x, x1), 1), edge_index)))
-    x3 = F.selu(self.bnorms[2](self.conv3(torch.cat((x, x1, x2), 1),
-                                         edge_index)))
-    out = x + 0.2*x3
+  def reset_parameters(self):
+    self.conv1.reset_parameters()
+    self.conv2.reset_parameters()
+    self.conv3.reset_parameters()
+
+  def forward(self, x, edge_index, pos):
+    x1 = F.selu(self.conv1(x, edge_index, pos), inplace=True)
+    x2 = F.selu(self.conv2(torch.cat((x, x1), 1), edge_index, pos), inplace=True)
+    x3 = F.selu(
+        self.conv3(torch.cat((x, x1, x2), 1), edge_index, pos), inplace=True)
+    out = x + self.beta*x3
     return out
 
 
@@ -363,20 +477,28 @@ class ERDB(nn.Module):
                dim: int,
                in_channels: int,
                growth_channels: int,
-               device: str = "cpu") -> None:
+               device: str = "cpu",
+               beta: float = 0.2) -> None:
     super(ERDB, self).__init__()
     self.dim = dim
     self.in_channels = in_channels
     self.growth_channels = growth_channels
     self.device = device
+    self.beta = beta
 
     self.rdb1 = RDB(dim, in_channels, growth_channels, device).to(device)
     self.rdb2 = RDB(dim, in_channels, growth_channels, device).to(device)
 
-  def forward(self, x, edge_index):
-    x1 = self.rdb1(x, edge_index)
-    x2 = self.rdb2(x + 0.2*x1, edge_index)
-    out = x + 0.2*x2
+    self.reset_parameters()
+
+  def reset_parameters(self):
+    self.rdb1.reset_parameters()
+    self.rdb2.reset_parameters()
+
+  def forward(self, x, edge_index, pos):
+    x1 = self.rdb1(x, edge_index, pos)
+    x2 = self.rdb2(x + self.beta*x1, edge_index, pos)
+    out = x + self.beta*x2
     return out
 
 
@@ -384,24 +506,35 @@ class NeighborhoodPool(nn.Module):
 
   def __init__(self,
                dim: int,
-               hidden_channels: int,
+               channels: int,
                k_hops: int = 1,
-               gnn: nn.Module = GCNConv,
+               gnn: nn.Module = GraphKernelConv,
                device: str = "cpu",
                **kwargs) -> None:
     super(NeighborhoodPool, self).__init__()
     self.dim = dim
     self.k_hops = k_hops
-    self.gnn1 = gnn(in_channels=dim, out_channels=hidden_channels, **kwargs).to(device)
+    self.gnn1 = gnn(
+        dim,
+        in_channels=dim,
+        hidden_channels=channels,
+        out_channels=channels,
+        device=device,
+        **kwargs).to(device)
     self.gnn2 = gnn(
-        in_channels=hidden_channels, out_channels=1, **kwargs).to(device)
+        dim,
+        in_channels=channels,
+        hidden_channels=channels,
+        out_channels=1,
+        device=device,
+        **kwargs).to(device)
     self.device = device
 
   def forward(self, x, edge_index, pos):
     edge_aug = add_remaining_self_loops(
         get_edge_aug(edge_index, pos, self.k_hops, self.device)[0])[0]
-    score = F.selu(self.gnn1(pos, edge_aug))
-    score = self.gnn2(score, edge_aug)
+    score = F.selu(self.gnn1(pos, edge_aug, pos))
+    score = self.gnn2(score, edge_aug, pos)
 
     new_order = torch.squeeze(torch.argsort(score, 0))
     old_order = torch.squeeze(torch.argsort(new_order, 0))
@@ -560,25 +693,60 @@ class DBGSR(nn.Module):
                dim: int,
                init_data_2: Data,
                hidden_channels: int,
-               device: str = "cpu") -> None:
+               device: str = "cpu",
+               beta: float = 0.2) -> None:
     super(DBGSR, self).__init__()
     self.dim = dim
     self.in_features = init_data_2.num_node_features
     self.hidden_channels = hidden_channels
     self.device = device
+    self.beta = beta
 
-    self.conv1 = GraphConv(self.in_features + dim + 3,
-                           hidden_channels).to(device)
-    self.conv2 = GraphConv(hidden_channels, hidden_channels).to(device)
-    self.conv3 = GraphConv(hidden_channels, hidden_channels).to(device)
-    # upsample
-    self.conv4 = GraphConv(hidden_channels, hidden_channels).to(device)
+    self.lin0 = Linear(self.in_features + dim, hidden_channels).to(device)
+
+    self.conv1 = GraphKernelConv(
+        dim, hidden_channels, hidden_channels, hidden_channels,
+        device=device).to(device)
     self.erdb1 = ERDB(dim, hidden_channels, -(hidden_channels // -2),
                       device).to(device)
     self.erdb2 = ERDB(dim, hidden_channels, -(hidden_channels // -2),
                       device).to(device)
+    self.conv2 = GraphKernelConv(
+        dim, hidden_channels, hidden_channels, hidden_channels,
+        device=device).to(device)
+    
+    # upsample
+    self.conv3 = GraphKernelConv(
+        dim, hidden_channels, hidden_channels, hidden_channels,
+        device=device).to(device)
+    self.erdb3 = ERDB(dim, hidden_channels, -(hidden_channels // -2),
+                      device).to(device)
+    self.erdb4 = ERDB(dim, hidden_channels, -(hidden_channels // -2),
+                      device).to(device)
+    self.conv4 = GraphKernelConv(
+        dim, hidden_channels, hidden_channels, hidden_channels,
+        device=device).to(device)
 
-    self.conv5 = GraphConv(hidden_channels, self.in_features).to(device)
+    # self.conv5 = GraphKernelConv(
+    #     dim, hidden_channels, hidden_channels, self.in_features,
+    #     device=device).to(device)
+    self.lin1 = Linear(hidden_channels, self.in_features).to(device)
+
+    self.reset_parameters()
+
+  def reset_parameters(self):
+    self.lin0.reset_parameters()
+    self.lin1.reset_parameters()
+
+    self.erdb1.reset_parameters()
+    self.erdb2.reset_parameters()
+    self.erdb3.reset_parameters()
+    self.erdb4.reset_parameters()
+
+    self.conv1.reset_parameters()
+    self.conv2.reset_parameters()
+    self.conv3.reset_parameters()
+    self.conv4.reset_parameters()
 
   def onera_transform(self, pos):
     # adjust x to move leading edge to x=0
@@ -593,18 +761,28 @@ class DBGSR(nn.Module):
     return knn_interpolate(
         f, self.onera_transform(pos_x), self.onera_transform(pos_y), k=1)
 
-  def forward(self, x, edge_index_2, edge_index_3, pos_2, pos_3, y):
-    x = F.selu(self.conv1(
-            torch.cat((x, pos_2, y*torch.ones_like(pos_2)), 1), edge_index_2), inplace=True)
-    x = F.selu(self.conv2(x, edge_index_2), inplace=True)
+  def forward(self, x, edge_index_2, edge_index_3, pos_2, pos_3):
+    # scale data
+    x = (x - x.min(dim=0).values) / (x.max(dim=0).values - x.min(dim=0).values)
+    pos_2 = (pos_2 - pos_2.min(dim=0).values) / (
+        pos_2.max(dim=0).values - pos_2.min(dim=0).values)
+    pos_3 = (pos_3 - pos_3.min(dim=0).values) / (
+        pos_3.max(dim=0).values - pos_3.min(dim=0).values)
+
+    x = F.selu(self.lin0(torch.cat((x, pos_2), 1)), inplace=True)
+    x1 = F.selu(self.conv1(x, edge_index_2, pos_2), inplace=True)
+    x2 = self.erdb1(x1, edge_index_2, pos_2)
+    x = x1 + self.beta*self.erdb2(x2, edge_index_3, pos_3)
+    x = F.selu(self.conv2(x, edge_index_2, pos_2), inplace=True)
 
     # upsample
     x = self.onera_interp(x, pos_2, pos_3)
-    
-    x1 = F.selu(self.conv3(x, edge_index_3), inplace=True)
-    x2 = self.erdb1(x1, edge_index_2)
-    x = x1 + 0.2*self.erdb2(x2, edge_index_2)
-    x = F.selu(self.conv4(x, edge_index_3), inplace=True)
 
-    out = self.conv5(x, edge_index_3)
+    x1 = F.selu(self.conv3(x, edge_index_3, pos_3), inplace=True)
+    x2 = self.erdb3(x1, edge_index_3, pos_3)
+    x = x1 + self.beta*self.erdb4(x2, edge_index_3, pos_3)
+    x = F.selu(self.conv4(x, edge_index_3, pos_3), inplace=True)
+
+    # out = self.conv5(x, edge_index_3, pos_3)
+    out = self.lin1(x)
     return out

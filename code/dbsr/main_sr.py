@@ -21,7 +21,7 @@ parser.add_argument(
 parser.add_argument(
     "--learning-rate", default=1e-3, type=float, help="Learning Rate")
 parser.add_argument("--wandb", default=0, type=bool, help="wandb upload")
-parser.add_argument("--debug", default=1, type=bool, help="debug")
+parser.add_argument("--debug", default=0, type=bool, help="debug")
 parser.add_argument('--gpu-id', default=0, type=int, help="GPU index")
 
 args = parser.parse_args()
@@ -127,8 +127,7 @@ def train_step():
     #     pair_batch.x_2, pair_batch.pos_2, pair_batch.pos_3)
     # out = model(x_in, pair_batch.edge_index_3, pair_batch.pos_3)
     out = model(pair_batch.x_2, pair_batch.edge_index_2,
-                pair_batch.edge_index_3, pair_batch.pos_2, pair_batch.pos_3,
-                pair_batch.y)
+                pair_batch.edge_index_3, pair_batch.pos_2, pair_batch.pos_3)
 
     batch_loss = loss_fn(out, pair_batch.x_3)
     batch_loss.backward()
@@ -149,8 +148,7 @@ def test_step():
       #     pair_batch.x_2, pair_batch.pos_2, pair_batch.pos_3)
       # out = model(x_in, pair_batch.edge_index_3, pair_batch.pos_3)
       out = model(pair_batch.x_2, pair_batch.edge_index_2,
-                  pair_batch.edge_index_3, pair_batch.pos_2, pair_batch.pos_3,
-                  pair_batch.y)
+                  pair_batch.edge_index_3, pair_batch.pos_2, pair_batch.pos_3)
 
       batch_loss = loss_fn(out, pair_batch.x_3)
       test_err = test_err + batch_loss/test_batches
@@ -170,7 +168,7 @@ def main(n_epochs):
 
     if debug:
       print("Loss: {:g}, Error {:g}, Epoch {:g}".format(loss, test_err, epoch))
-    if epoch % 100 == 0 or epoch == n_epochs - 1:
+    if epoch % 10 == 0 or epoch == n_epochs - 1:
       if wandb_upload:
         wandb.log({
             "Loss": loss,

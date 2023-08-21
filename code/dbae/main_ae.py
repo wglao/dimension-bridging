@@ -67,12 +67,12 @@ if wandb_upload:
   test_dataset = PairDataset(data_path, ma_list, [4e6, 7e6, 1e7], aoa_list,
                              "test", n_slices)
 else:
-  # train_dataset = PairDataset(data_path, [0.3, 0.4], [3e6, 4e6], [3, 4],
-  #                             "idev-train", n_slices)
-  # test_dataset = PairDataset(data_path, [0.5, 0.6], [5e6, 6e6], [5, 6],
-  #                            "idev-test", n_slices)
-  train_dataset = PairDataset(data_path, [0.3], [3e6], [3], "recon", n_slices)
-  test_dataset = PairDataset(data_path, [0.3], [3e6], [3], "recon", n_slices)
+  train_dataset = PairDataset(data_path, [0.3, 0.4], [3e6, 4e6], [3, 4],
+                              "idev-train", n_slices)
+  test_dataset = PairDataset(data_path, [0.5, 0.6], [5e6, 6e6], [5, 6],
+                             "idev-test", n_slices)
+  # train_dataset = PairDataset(data_path, [0.3], [3e6], [3], "recon", n_slices)
+  # test_dataset = PairDataset(data_path, [0.3], [3e6], [3], "recon", n_slices)
 
 n_samples = len(train_dataset)
 batch_sz = int(np.min(np.array([1, n_samples])))
@@ -126,7 +126,7 @@ def train_step():
     pair_batch = pair_batch.to(device)
     out, pool_edge_list_2, pool_edge_list_3, _, _, score_list_2, score_list_3 = model(
         pair_batch.x_3, pair_batch.edge_index_3, pair_batch.pos_3,
-        pair_batch.x_2, pair_batch.edge_index_2, pair_batch.pos_2, pair_batch.y)
+        pair_batch.x_2, pair_batch.edge_index_2, pair_batch.pos_2)
 
     data_loss = loss_fn(out, pair_batch.x_3)
 
@@ -166,7 +166,7 @@ def test_step():
       pair_batch = pair_batch.to(device)
       out, _, _ = model(pair_batch.x_3, pair_batch.edge_index_3,
                         pair_batch.pos_3, pair_batch.x_2,
-                        pair_batch.edge_index_2, pair_batch.pos_2, pair_batch.y)
+                        pair_batch.edge_index_2, pair_batch.pos_2)
       batch_loss = loss_fn(out, pair_batch.x_3)
       test_err += batch_loss
     test_err /= test_batches

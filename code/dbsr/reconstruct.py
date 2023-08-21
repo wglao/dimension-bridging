@@ -6,7 +6,7 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.data import Data
 from torch_geometric.nn import knn_interpolate
 import numpy as np
-from models_sr import DBMGN, get_deg
+from models_sr import DBMGN, DBGSR, get_deg
 from graphdata import PairDataset
 
 today = date.today()
@@ -16,29 +16,27 @@ import argparse
 parser = argparse.ArgumentParser()
 
 parser.add_argument(
-    "--case-name", default="dba-mgn", type=str, help="Architecture Name")
+    "--case-name", default="dba-grdb", type=str, help="Architecture Name")
 parser.add_argument(
     "--channels", default=10, type=int, help="Aggregation Channels")
 parser.add_argument(
     "--learning-rate", default=1e-3, type=float, help="Learning Rate")
 parser.add_argument("--wandb", default=1, type=int, help="wandb upload")
+parser.add_argument("--debug", default=0, type=int, help="debug printing")
 parser.add_argument('--gpu-id', default=0, type=int, help="GPU index")
-parser.add_argument("--mach", default=0.5, type=float, help="Mach Number")
+parser.add_argument("--mach", default=0.3, type=float, help="Mach Number")
 parser.add_argument(
-    "--reynolds", default=1e7, type=float, help="Reynolds Number")
-parser.add_argument("--aoa", default=3, type=float, help="Angle of Attack")
+    "--reynolds", default=3e6, type=float, help="Reynolds Number")
+parser.add_argument("--aoa", default=3., type=float, help="Angle of Attack")
 parser.add_argument(
-    "--date",
-    default=today.strftime("%d%m%y"),
-    type=str,
-    help="Date of Run (ddmmyy)")
-parser.add_argument("--epoch", default=100, type=int, help="Checkpoint Epoch")
+    "--date", default="180823", type=str, help="Date of run in ddmmyy")
+parser.add_argument("--epoch", default=811, type=int, help="Checkpoint Epoch")
 
 args = parser.parse_args()
 case_name = "_".join([
     str(key) + "-" + str(value) for key, value in list(vars(args).items())[:-6]
 ])[10:]
-device = "cuda:{:d}".format(args.gpu_id)
+device = "cuda:{:d}".format(args.gpu_id) if args.gpu_id >= 0 else "cpu"
 
 data_path = os.path.join(os.environ["SCRATCH"], "ORNL/dimension-bridging/data")
 save_path = os.path.join(data_path, "models_save")
@@ -46,26 +44,20 @@ save_path = os.path.join(data_path, "models_save")
 
 def main(save_path):
   n_slices = 5
-  #   on_dataset = PairDataset(data_path, [args.mach], [args.reynolds],
-  #                               [args.aoa], "recon", n_slices)
   recon_dataset = PairDataset(data_path, [args.mach], [args.reynolds],
-                              [args.aoa], "train", n_slices)
+                              [args.aoa], "recon", n_slices)
+  # recon_dataset = PairDataset(data_path, [args.mach], [args.reynolds],
+  #                             [args.aoa], "train", n_slices)
   #   recon_dataset = PairDataset(data_path, [args.mach], [args.reynolds],
   #                               [args.aoa], "test", n_slices)
   #   recon_dataset = PairDataset(data_path, [args.mach], [args.reynolds],
   #                               [args.aoa], "all", n_slices)
   recon_loader = DataLoader(recon_dataset)
 
-  pair = next(iter(recon_loader))[0].cuda(device)
-  init_data = Data(pair.x_3, pair.edge_index_3, pos=pair.pos_3)
+  pair = next(iter(recon_loader))[0].to(device)
+  init_data = Data(pair.x_2, pair.edge_index_2, pos=pair.pos_2)
 
-  # set kernel size to mean of node degree vector
-  # deg = get_deg(init_data.x, init_data.edge_index)
-  # k = int(torch.ceil(torch.mean(deg)))
-  # del deg
-  k = 3
-  
-  model = DBMGN(3, init_data, args.channels).cuda(device)
+  model = DBGSR(3, init_data, args.channels, device).to(device)
 
   # get save
   run_path = os.path.join(save_path, case_name, args.date)
@@ -77,13 +69,15 @@ def main(save_path):
     state_dict = torch.load(save, device)
     model.load_state_dict(state_dict)
   else:
-    print("Model with requested architecture and epoch not saved.\nExiting.")
+    print(
+        "Model with requested architecture {:s} and epoch {:d} not saved.\nExiting."
+        .format(case_name, args.epoch))
     return
 
   model.eval()
   with torch.no_grad():
-    x_in = knn_interpolate(pair.x_2, pair.pos_2, pair.pos_3, k=k).cuda(device)
-    f_recon = model(x_in, pair.edge_index_3.cuda(device), pair.pos_3.cuda(device))
+    f_recon = model(pair.x_2, pair.edge_index_2, pair.edge_index_3, pair.pos_2,
+                    pair.pos_3)
     mse_rho = torch.nn.MSELoss()(f_recon[:, 0], pair.x_3[:, 0])
     mse_u = torch.nn.MSELoss()(f_recon[:, 1:4], pair.x_3[:, 1:4])
     mse_e = torch.nn.MSELoss()(f_recon[:, 4], pair.x_3[:, 4])
@@ -114,10 +108,10 @@ def main(save_path):
         [abs_rho, abs_u, abs_e], [rel_rho, rel_u, rel_e],
         ["Density", "Momentum", "Energy"]):
       #   for field in ["Density"]:
-      mesh.point_data.set_array(recon.cpu().detach().numpy(), field + "_Recon")
-      mesh.point_data.set_array(abs_arr.cpu().detach().numpy(),
+      mesh.point_data.set_array(recon.squeeze().cpu().detach().numpy(), field + "_Recon")
+      mesh.point_data.set_array(abs_arr.squeeze().cpu().detach().numpy(),
                                 field + "_Abs_Err")
-      mesh.point_data.set_array(rel_arr.cpu().detach().numpy(),
+      mesh.point_data.set_array(rel_arr.squeeze().cpu().detach().numpy(),
                                 field + "_Rel_Err")
 
     save_path = os.path.join(

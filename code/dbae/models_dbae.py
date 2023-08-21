@@ -1,18 +1,33 @@
 import torch
 import math
 from torch import Tensor
-from torch_geometric.typing import OptTensor
-from typing import Tuple, Union, Optional, Callable
+from torch_geometric.nn.aggr import Aggregation
+from torch_geometric.typing import (
+    Adj,
+    OptPairTensor,
+    OptTensor,
+    SparseTensor,
+    torch_sparse,
+)
+from typing import Any, Dict, List, Tuple, Union, Optional, Callable
 from torch import nn
 from torch_geometric.data import Batch, Data
 from torch_geometric.loader import ClusterData, ClusterLoader
-from torch_geometric.nn import SAGEConv, SAGPooling, GATv2Conv, GCNConv, GraphConv, GINConv, Linear, knn_interpolate
+from torch_geometric.nn import SAGEConv, SAGPooling, GATv2Conv, GCNConv, GraphConv, GINConv, Linear
+from torch_geometric.nn import MessagePassing, knn_interpolate
 from torch_geometric.nn import Sequential as GeoSequential
 from torch_geometric.nn.norm import BatchNorm
 from torch_geometric.nn.pool.topk_pool import filter_adj, topk
 from torch_geometric.nn.pool import max_pool, avg_pool_neighbor_x
 from torch_geometric.utils import softmax, add_self_loops, add_remaining_self_loops
-from torch.nn import ReLU, Sequential
+from torch_geometric.utils import (
+    is_torch_sparse_tensor,
+    scatter,
+    spmm,
+    to_edge_index,
+)
+from torch_geometric.nn.inits import zeros
+from torch.nn import Parameter
 import torch.nn.functional as F
 from graphdata import PairData
 import numpy as np
@@ -40,21 +55,21 @@ def get_edge_attr(edge_index, pos):
 
 
 def get_edge_aug(edge_index, pos, steps: int = 1, device: str = "cpu"):
-  # adj = torch.sparse_coo_tensor(edge_index,
-  #                               torch.ones(edge_index.size(1),).to(device))
-  # adj_aug = adj
-  # if steps >= 1:
-  #   for _ in range(steps - 1):
-  #     adj_aug = (adj_aug @ adj).coalesce()
-  #   adj_aug = (adj + adj_aug).coalesce()
-  # edge_index_aug = adj_aug.indices()
-  # edge_attr_aug = get_edge_attr(edge_index_aug, pos)
-  # return edge_index_aug, edge_attr_aug
+  adj = torch.sparse_coo_tensor(edge_index,
+                                torch.ones(edge_index.size(1),).to(device))
+  adj_aug = adj
+  if steps >= 1:
+    for _ in range(steps - 1):
+      adj_aug = (adj_aug @ adj).coalesce()
+    adj_aug = (adj + adj_aug).coalesce()
+  edge_index_aug = adj_aug.indices()
+  edge_attr_aug = get_edge_attr(edge_index_aug, pos)
+  return edge_index_aug, edge_attr_aug
 
-  edge_index = add_remaining_self_loops(edge_index)[0].unique(dim=1)
-  
-  # assume symmetric graph
-  get_edge_aug = torch.cat(torch.vmap(lambda n: (edge_index[0]==n) & (edge_index[1]>n)))
+  # edge_index = add_remaining_self_loops(edge_index)[0].unique(dim=1)
+
+  # # assume symmetric graph
+  # get_edge_aug = torch.cat(torch.vmap(lambda n: (edge_index[0]==n) & (edge_index[1]>n)))
 
 
 def onera_transform(pos):
@@ -72,40 +87,123 @@ def onera_interp(f, pos_x, pos_y):
   return knn_interpolate(f, onera_transform(pos_x), onera_transform(pos_y))
 
 
-# class Neighborhood():
+class KernelMLP(nn.Module):
 
-#   def __init__(self, x: torch.Tensor, old_ids: torch.Tensor, pos: torch.Tensor,
-#                node_id: int):
-#     self.x = x
-#     self.pos = pos
-#     self.node_id = node_id
-#     self.old_ids = old_ids
+  def __init__(self,
+               dim: int,
+               hidden_channels: int,
+               device: str = "cpu") -> None:
+    super(KernelMLP, self).__init__()
+    self.dim = dim
+    self.hidden_channels = hidden_channels
+    self.device = device
 
-#     self.pool_val, _ = torch.max(x, 0)
+    self.lin0 = Linear(
+        dim, hidden_channels, weight_initializer='glorot').to(device)
+    # self.lin1 = Linear(
+    #     hidden_channels, hidden_channels,
+    #     weight_initializer='glorot').to(device)
+    self.lin2 = Linear(
+        hidden_channels, 1, weight_initializer='glorot').to(device)
+
+    self.reset_parameters()
+
+  def reset_parameters(self):
+    self.lin0.reset_parameters()
+    # self.lin1.reset_parameters()
+    self.lin2.reset_parameters()
+
+  def forward(self, rel_pos):
+    out = F.selu(self.lin0(rel_pos), inplace=True)
+    # out = F.selu(self.lin1(out), inplace=True)
+    out = self.lin2(out)
+    return out
+
+
+class GraphKernelConv(MessagePassing):
+
+  def __init__(self,
+               dim: int,
+               in_channels: int,
+               hidden_channels: int,
+               out_channels: int,
+               k_net: nn.Module = KernelMLP,
+               device: str = "cpu",
+               **kwargs):
+    kwargs.setdefault('aggr', 'add')
+    super(GraphKernelConv, self).__init__()
+    self.dim = dim
+    self.in_channels = in_channels
+    self.hidden_channels = hidden_channels
+    self.out_channels = out_channels
+    self.device = device
+
+    self.k_net = k_net(dim, hidden_channels, device).to(device)
+    self.lin0 = Linear(in_channels, hidden_channels).to(device)
+    self.lin1 = Linear(hidden_channels, out_channels).to(device)
+
+    self.bias = Parameter(torch.Tensor(out_channels)).to(device)
+
+    self.reset_parameters()
+
+  def reset_parameters(self):
+    super().reset_parameters()
+    self.k_net.reset_parameters()
+    self.lin0.reset_parameters()
+    self.lin1.reset_parameters()
+    zeros(self.bias)
+    self._cached_edge_index = None
+
+  def forward(self, x, edge_index, pos):
+    x = F.selu(self.lin0(x), inplace=True)
+    edge_index, _ = add_remaining_self_loops(edge_index)
+    edge_weight = self.k_net(get_edge_attr(edge_index, pos))
+
+    out = self.propagate(edge_index, x=x, edge_weight=edge_weight, size=None)
+    out = self.lin1(out)
+
+    return out
+
+  def message(self, x_j: Tensor, edge_weight: OptTensor) -> Tensor:
+    return x_j if edge_weight is None else edge_weight.view(-1, 1)*x_j
+
+  def message_and_aggregate(self, adj_t: SparseTensor, x: Tensor) -> Tensor:
+    return spmm(adj_t, x, reduce=self.aggr)
 
 
 class NeighborhoodPool(nn.Module):
 
   def __init__(self,
                dim: int,
-               hidden_channels: int,
+               channels: int,
                k_hops: int = 1,
-               gnn: nn.Module = GCNConv,
+               gnn: nn.Module = GraphKernelConv,
                device: str = "cpu",
                **kwargs) -> None:
     super(NeighborhoodPool, self).__init__()
     self.dim = dim
     self.k_hops = k_hops
-    self.gnn1 = gnn(in_channels=dim, out_channels=hidden_channels, **kwargs).to(device)
+    self.gnn1 = gnn(
+        dim,
+        in_channels=dim,
+        hidden_channels=channels,
+        out_channels=channels,
+        device=device,
+        **kwargs).to(device)
     self.gnn2 = gnn(
-        in_channels=hidden_channels, out_channels=1, **kwargs).to(device)
+        dim,
+        in_channels=channels,
+        hidden_channels=channels,
+        out_channels=1,
+        device=device,
+        **kwargs).to(device)
     self.device = device
 
   def forward(self, x, edge_index, pos):
     edge_aug = add_remaining_self_loops(
         get_edge_aug(edge_index, pos, self.k_hops, self.device)[0])[0]
-    score = F.selu(self.gnn1(pos, edge_aug))
-    score = self.gnn2(score, edge_aug)
+    score = F.selu(self.gnn1(pos, edge_aug, pos))
+    score = self.gnn2(score, edge_aug, pos)
 
     new_order = torch.squeeze(torch.argsort(score, 0))
     old_order = torch.squeeze(torch.argsort(new_order, 0))
@@ -184,18 +282,24 @@ class Encoder(nn.Module):
     self.device = device
 
     # initial aggr
-    self.conv_list = nn.ModuleList(
-        [GCNConv(
-            self.in_channels + dim + 3,
-            hidden_channels,
-        ).to(self.device)])
-    self.bn_list = nn.ModuleList([BatchNorm(hidden_channels)])
-    self.conv_list.append(
-        GCNConv(
+    self.lin0 = Linear(self.in_channels, hidden_channels).to(self.device)
+    self.lin1 = Linear(hidden_channels, latent_channels).to(self.device)
+
+    self.conv_list = nn.ModuleList([
+        GraphKernelConv(
+            dim,
             hidden_channels + dim,
             hidden_channels,
-        ).to(self.device))
-    self.bn_list.append(BatchNorm(hidden_channels))
+            hidden_channels,
+            device=device).to(self.device)
+    ])
+    self.conv_list.append(
+        GraphKernelConv(
+            dim,
+            hidden_channels + dim,
+            hidden_channels,
+            hidden_channels,
+            device=device).to(self.device))
 
     # pools
     self.pool_list = nn.ModuleList()
@@ -210,28 +314,28 @@ class Encoder(nn.Module):
           ).to(device))
 
       self.conv_list.append(
-          GCNConv(
+          GraphKernelConv(
+              dim,
               hidden_channels + dim,
               hidden_channels,
-          ).to(self.device))
-      self.bn_list.append(BatchNorm(hidden_channels))
+              hidden_channels,
+              device=device).to(self.device))
 
     # latent
     # out_sz = get_pooled_sz(init_data.num_nodes, k_hops, n_pools)
     self.conv_list.append(
-        GCNConv(
+        GraphKernelConv(
+            dim,
             hidden_channels + dim,
             hidden_channels,
-        ).to(self.device))
-    self.bn_list.append(BatchNorm(hidden_channels))
+            hidden_channels,
+            device=device).to(self.device))
 
-    self.lin = Linear(hidden_channels, latent_channels).to(self.device)
-
-  def forward(self, x, y, edge_index, pos):
-    x = F.selu((self.conv_list[0](torch.cat(
-        (x, pos, y*torch.ones_like(pos)), dim=1), edge_index)),
+  def forward(self, x, edge_index, pos):
+    x = F.selu(self.lin0(x), inplace=True)
+    x = F.selu((self.conv_list[0](torch.cat((x, pos), dim=1), edge_index, pos)),
                inplace=True)
-    x = F.selu((self.conv_list[1](torch.cat((x, pos), dim=1), edge_index)),
+    x = F.selu((self.conv_list[1](torch.cat((x, pos), dim=1), edge_index, pos)),
                inplace=True)
 
     pool_edge_list = [edge_index]
@@ -249,12 +353,13 @@ class Encoder(nn.Module):
       if self.training:
         score_list.insert(0, score)
       x = F.selu((self.conv_list[l + 2](torch.cat(
-          (x, pos), dim=1), edge_index)),
+          (x, pos), dim=1), edge_index, pos)),
                  inplace=True)
 
-    x = F.selu((self.conv_list[-1](torch.cat((x, pos), dim=1), edge_index)),
+    x = F.selu((self.conv_list[-1](torch.cat(
+        (x, pos), dim=1), edge_index, pos)),
                inplace=True)
-    x = self.lin(x)
+    x = F.selu(self.lin1(x), inplace=True)
     if self.training:
       return x, pool_edge_list, pool_pos_list, score_list
     return x, pool_edge_list, pool_pos_list
@@ -332,23 +437,26 @@ class Decoder(nn.Module):
 
     # latent dense map
     # self.out_sz = get_pooled_sz(init_data.num_nodes, k_hops, n_pools)
-    self.lin = Linear(latent_channels, hidden_channels).to(self.device)
-    self.bn_list = nn.ModuleList([BatchNorm(hidden_channels)])
+    self.lin0 = Linear(latent_channels, hidden_channels).to(self.device)
+    self.lin1 = Linear(hidden_channels, self.out_channels).to(self.device)
 
     # initial aggr
-    self.conv_list = nn.ModuleList(
-        [GCNConv(
+    self.conv_list = nn.ModuleList([
+        GraphKernelConv(
+            dim,
             hidden_channels + dim,
             hidden_channels,
-        ).to(self.device)])
-    self.bn_list.append(BatchNorm(hidden_channels))
+            hidden_channels,
+            device=device).to(self.device)
+    ])
 
     self.conv_list.append(
-        GCNConv(
+        GraphKernelConv(
+            dim,
             hidden_channels + dim,
             hidden_channels,
-        ).to(self.device))
-    self.bn_list.append(BatchNorm(hidden_channels))
+            hidden_channels,
+            device=device).to(self.device))
 
     # # no initial aggr
     # self.conv_list = nn.ModuleList()
@@ -356,27 +464,30 @@ class Decoder(nn.Module):
     # unpools
     for _ in range(n_pools):
       self.conv_list.append(
-          GCNConv(
+          GraphKernelConv(
+              dim,
               hidden_channels + dim,
               hidden_channels,
-          ).to(self.device))
-      self.bn_list.append(BatchNorm(hidden_channels))
+              hidden_channels,
+              device=device).to(self.device))
 
     self.conv_list.append(
-        GCNConv(
+        GraphKernelConv(
+            dim,
             hidden_channels + dim,
-            self.out_channels,
-        ).to(self.device))
+            hidden_channels,
+            hidden_channels,
+            device=device).to(self.device))
 
   def forward(self, latent, edge_index_list, pos_list):
     # INITIAL AGG
-    x = F.selu((self.lin(latent)), inplace=True)
-    edge_index = edge_index_list[0]
-    pos = pos_list[0]
-    x = F.selu((self.conv_list[0](torch.cat((x, pos), dim=1), edge_index)),
-               inplace=True)
-    x = F.selu((self.conv_list[1](torch.cat((x, pos), dim=1), edge_index)),
-               inplace=True)
+    x = F.selu((self.lin0(latent)), inplace=True)
+    # edge_index = edge_index_list[0]
+    # pos = pos_list[0]
+    # x = F.selu((self.conv_list[0](torch.cat((x, pos), dim=1), edge_index, pos)),
+    #            inplace=True)
+    # x = F.selu((self.conv_list[1](torch.cat((x, pos), dim=1), edge_index, pos)),
+    #            inplace=True)
 
     # # NO INITIAL AGG
     # x = latent
@@ -387,14 +498,17 @@ class Decoder(nn.Module):
       pos = pos_list[l + 1]
       # WITH INITIAL AGG
       x = F.selu((self.conv_list[l + 2](torch.cat(
-          (x, pos), dim=1), edge_index)),
+          (x, pos), dim=1), edge_index, pos)),
                  inplace=True)
 
       # # # NO INITIAL AGG
       # x = F.selu(
-      #     self.conv_list[l](torch.cat((x, pos), dim=1), edge_index),
+      #     self.conv_list[l](torch.cat((x, pos), dim=1), edge_index, pos),
       #     inplace=True)
-    out = self.conv_list[-1](torch.cat((x, pos), dim=1), edge_index)
+    out = F.selu(
+        self.conv_list[-1](torch.cat((x, pos), dim=1), edge_index, pos),
+        inplace=True)
+    out = self.lin1(out)
     if out.isnan().sum():
       breakpoint()
     return out
@@ -423,8 +537,7 @@ class DBA(nn.Module):
     init_data_3 = Data(
         x=init_data.x_3, edge_index=init_data.edge_index_3, pos=init_data.pos_3)
     self.encoder3D = StructureEncoder(dim, init_data_3, hidden_channels,
-                                      latent_channels, n_pools, k_hops,
-                                      device)
+                                      latent_channels, n_pools, k_hops, device)
 
     # used for model eval
     init_data_2 = Data(
@@ -447,37 +560,41 @@ class DBA(nn.Module):
               x_2,
               edge_index_2,
               pos_2,
-              y,
               pool_edge_list=None,
               pool_pos_list=None):
+    # scale data
+    x_2 = (x_2 - x_2.min(dim=0).values) / (
+        x_2.max(dim=0).values - x_2.min(dim=0).values)
+    x_3 = (x_3 - x_3.min(dim=0).values) / (
+        x_3.max(dim=0).values - x_3.min(dim=0).values)
+    pos_2 = (pos_2 - pos_2.min(dim=0).values) / (
+        pos_2.max(dim=0).values - pos_2.min(dim=0).values)
+    pos_3 = (pos_3 - pos_3.min(dim=0).values) / (
+        pos_3.max(dim=0).values - pos_3.min(dim=0).values)
+
     ret = 0
     if self.training:
       latent_2, edge_list_2, pos_list_2, score_list_2 = self.encoder2D(
-          x_2, y, edge_index_2, pos_2)
+          x_2, edge_index_2, pos_2)
     else:
       latent_2, edge_list_2, pos_list_2 = self.encoder2D(
-          x_2, y, edge_index_2, pos_2)
+          x_2, edge_index_2, pos_2)
 
     if pool_edge_list is None and pool_pos_list is None:
       if self.training:
         pool_edge_list, pool_pos_list, score_list_3 = self.encoder3D(
-            x_3, edge_index_3,
-            pos_3)
+            x_3, edge_index_3, pos_3)
       else:
-        pool_edge_list, pool_pos_list = self.encoder3D(
-            x_3, edge_index_3,
-            pos_3)
+        pool_edge_list, pool_pos_list = self.encoder3D(x_3, edge_index_3, pos_3)
       ret = 1
-      pool_edge_list.insert(0,
-                            edge_list_2[0])
+      pool_edge_list.insert(0, edge_list_2[0])
       pool_pos_list.insert(0, pos_list_2[0])
 
       # pool_edge_list = [x.to(self.device) for x in pool_edge_list]
       # pool_pos_list = [x.to(self.device) for x in pool_pos_list]
     else:
       pool_edge_list.pop(0)
-      pool_edge_list.insert(0,
-                            edge_list_2[0])
+      pool_edge_list.insert(0, edge_list_2[0])
 
       pool_pos_list.pop(0)
       pool_pos_list.insert(0, pos_list_2[0])
