@@ -560,8 +560,10 @@ class DBA(nn.Module):
               x_2,
               edge_index_2,
               pos_2,
-              pool_edge_list=None,
-              pool_pos_list=None):
+              pool_edge_list_2=None,
+              pool_edge_list_3=None,
+              pool_pos_list_2=None,
+              pool_pos_list_3=None):
     # scale data
     x_2 = (x_2 - x_2.min(dim=0).values) / (
         x_2.max(dim=0).values - x_2.min(dim=0).values)
@@ -573,42 +575,50 @@ class DBA(nn.Module):
         pos_3.max(dim=0).values - pos_3.min(dim=0).values)
 
     ret = 0
-    if self.training:
-      latent_2, edge_list_2, pos_list_2, score_list_2 = self.encoder2D(
-          x_2, edge_index_2, pos_2)
-    else:
-      latent_2, edge_list_2, pos_list_2 = self.encoder2D(
-          x_2, edge_index_2, pos_2)
-
-    if pool_edge_list is None and pool_pos_list is None:
+    if pool_edge_list_2 is None and pool_pos_list_2 is None:
       if self.training:
-        pool_edge_list, pool_pos_list, score_list_3 = self.encoder3D(
+        latent_2, pool_edge_list_2, pool_pos_list_2, score_list_2 = self.encoder2D(
+            x_2, edge_index_2, pos_2)
+      else:
+        latent_2, pool_edge_list_2, pool_pos_list_2 = self.encoder2D(
+            x_2, edge_index_2, pos_2)
+    else:
+      if self.training:
+        latent_2, _ = self.encoder2D(
+            x_2, pool_edge_list_2, pool_pos_list_2)
+      else:
+        latent_2 = self.encoder2D(
+            x_2, pool_edge_list_2, pool_pos_list_2)
+
+    if pool_edge_list_3 is None and pool_pos_list_3 is None:
+      if self.training:
+        pool_edge_list_3, pool_pos_list_3, score_list_3 = self.encoder3D(
             x_3, edge_index_3, pos_3)
       else:
-        pool_edge_list, pool_pos_list = self.encoder3D(x_3, edge_index_3, pos_3)
+        pool_edge_list_3, pool_pos_list_3 = self.encoder3D(x_3, edge_index_3, pos_3)
       ret = 1
-      pool_edge_list.insert(0, edge_list_2[0])
-      pool_pos_list.insert(0, pos_list_2[0])
+      pool_edge_list_3.insert(0, pool_edge_list_2[0])
+      pool_pos_list_3.insert(0, pool_pos_list_2[0])
 
       # pool_edge_list = [x.to(self.device) for x in pool_edge_list]
       # pool_pos_list = [x.to(self.device) for x in pool_pos_list]
     else:
-      pool_edge_list.pop(0)
-      pool_edge_list.insert(0, edge_list_2[0])
+      # pool_edge_list.pop(0)
+      pool_edge_list_3.insert(0, pool_edge_list_2[-1])
 
-      pool_pos_list.pop(0)
-      pool_pos_list.insert(0, pos_list_2[0])
+      # pool_pos_list.pop(0)
+      pool_pos_list_3.insert(0, pool_pos_list_2[-1])
 
       # pool_edge_list = [x.to(self.device) for x in pool_edge_list]
       # pool_pos_list = [x.to(self.device) for x in pool_pos_list]
 
-    out = self.decoder(latent_2, pool_edge_list, pool_pos_list)
+    out = self.decoder(latent_2, pool_edge_list_3, pool_pos_list_3)
 
     if ret == 1:
       if self.training:
-        return (out, edge_list_2, pool_edge_list, pos_list_2, pool_pos_list,
+        return (out, pool_edge_list_2, pool_edge_list_3, pool_pos_list_2, pool_pos_list_3,
                 score_list_2, score_list_3)
-      return out, pool_edge_list, pool_pos_list
+      return out, pool_edge_list_2, pool_edge_list_3, pool_pos_list_2, pool_pos_list_3
     if self.training:
-      return out, score_list_2
+      return out
     return out

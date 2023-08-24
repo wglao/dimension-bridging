@@ -1,5 +1,7 @@
 import os
 import sys
+import glob
+import scipy.sparse as sp
 from datetime import date
 import shutil
 from functools import partial
@@ -89,6 +91,134 @@ init_data = init_data[0].to(device)
 
 k_hops = args.k_hops
 
+pool_path = os.path.join(os.environ["SCRATCH"],
+                              "ORNL/dimension-bridging/data/processed/pool")
+if not os.path.exists(pool_path):
+  os.makedirs(pool_path, exist_ok=True)
+
+saved_pool = bool(len(glob.glob(os.path.join(pool_path, "pool*.pt"))))
+
+if not saved_pool:
+
+  def get_deg(x, edge_index):
+    deg = sp.csc_matrix(torch.ones(
+        (edge_index.size(1),)), edge_index, (x.size(0), x.size(0))) @ torch.ones((x.size(0), 1))
+    return deg
+
+  def get_laplacian(x, edge_index):
+    n_nodes = x.size(0)
+    adj = sp.csc_matrix(torch.ones(edge_index.size(1),), edge_index, (n_nodes,n_nodes))
+    deg_idx = torch.stack((torch.arange(n_nodes), torch.arange(n_nodes)), dim=0)
+    deg = torch.squeeze(get_deg(x, edge_index))
+    sqrt_deg = sp.csc_matrix(1 / deg, deg_idx, (n_nodes, n_nodes))
+    lapl = sp.csc_matrix(deg, deg_idx, (n_nodes, n_nodes)) - adj
+    lapl_norm = (sp.eye(n_nodes) -
+            sqrt_deg.dot(adj.dot(sqrt_deg)))
+    return lapl, lapl_norm
+
+  def get_basis(x, edge_index, kept_modes, lapl_norm=None):
+    if lapl_norm is None:
+      _, lapl_norm = get_laplacian(x, edge_index).to_dense()
+
+    # # LAPL TOO BIG FOR TORCH EIG
+    # _, eigvec = torch.linalg.eigh(lapl)
+
+    # # USE LOBPCG
+    vals, basis = torch.lobpcg(lapl_norm, kept_modes, niter=-1)
+    return vals, basis
+  
+  def get_edge_list(adj):
+    """Get the edge list from a CSC sparse matrix.
+
+    Parameters
+    ----------
+    adj : scipy.sparse.csc_matrix
+        The CSC sparse matrix.
+
+    Returns
+    -------
+    [2,m] tensor of edges (senders, receivers)
+        The edge list.
+    """
+
+    rows = adj.indptr
+    cols = adj.indices
+    data = adj.data
+
+    edges = []
+    for i in range(len(rows) - 1):
+        for j in range(rows[i], rows[i + 1]):
+            edges.append((cols[j], data[j]))
+
+    return torch.tensor(edges).transpose(0,1)
+  
+  def decimation_pool(x, edge_index, pos):
+    n_nodes = x.size(0)
+    adj = sp.csc_matrix(torch.ones(edge_index.size(1),), edge_index, (n_nodes,n_nodes))
+    adj_list = [adj]
+    pos_list = [pos]
+
+    for l in args.pooling_layers:
+      lapl, lapl_norm = get_laplacian(x, edge_index)
+      _, vec = get_basis(x, edge_index, 1, lapl_norm)
+      z_vec = torch.where(vec >= 0, 1, -1)
+      gamma = z_vec.transpose(0,1) @ (lapl @ z_vec) / 2*edge_index.size(1)
+      # if gamma is worse than random cut
+      if gamma < 0.5:
+        # random cut with z in {-1,1}
+        z_vec = torch.where(torch.randint(0,1,z_vec.size()) > 0, 1, -1)
+      keep_idx = torch.argwhere(z_vec>0)
+      drop_idx = torch.argwhere(z_vec<0)
+
+      lapl_keep = lapl[np.ix_(keep_idx,keep_idx)]
+      lapl_in_out = lapl[np.ix_(keep_idx,drop_idx)]
+      lapl_out_in = lapl[np.ix_(drop_idx,keep_idx)]
+      lapl_drop = lapl[np.ix_(drop_idx,drop_idx)]
+
+      try:
+        lapl_new = lapl_keep - lapl_in_out.dot(sp.linalg.spsolve(lapl_drop, lapl_out_in))
+      except RuntimeError:
+        # If lapl_drop is exactly singular, damp the inversion with
+        # Marquardt-Levenberg coefficient ml_c
+        ml_c = sp.csc_matrix(sp.eye(lapl_drop.shape[0]) * 1e-6)
+        lapl_new = lapl_keep - lapl_in_out.dot(sp.linalg.spsolve(ml_c + lapl_drop, lapl_out_in))
+      
+      # Make the laplacian symmetric if it is almost symmetric
+      if np.abs(lapl_new - lapl_new.T).sum() < np.spacing(1) * np.abs(lapl_new).sum():
+        lapl_new = (lapl_new + lapl_new.T) / 2.
+      
+      adj_new = -lapl_new
+      adj_new.set_diag(0)
+      adj_new.eliminate_zeros()
+      adj_list.append(adj_new)
+
+      pos = pos[keep_idx]
+      pos_list.append(pos)
+    
+    for adj in adj_list[1:]:
+      adj = adj * np.abs(adj) > 1e-1
+
+    edge_index_list = [get_edge_list(adj) for adj in adj_list]
+    return edge_index_list, pos_list
+
+
+
+  # move to cpu for memory
+  init_data.cpu().detach()
+  edge_index_list_2, pos_list_2 = decimation_pool(init_data.x_2, init_data.edge_index_2, init_data.pos_2)
+  edge_index_list_3, pos_list_3 = decimation_pool(init_data.x_3, init_data.edge_index_3, init_data.pos_3)
+  
+  pool_structures = {
+      "ei2": edge_index_list_2,
+      "ei3": edge_index_list_3,
+      "p2": pos_list_2,
+      "p3": pos_list_3
+  }
+
+  torch.save(os.path.join(pool_path, "pool.pt"),pool_structures)
+else:
+  pool_structures = torch.load(os.path.join(pool_path, "pool.pt"))
+
 if debug:
   print('Init')
 
@@ -124,25 +254,27 @@ def train_step():
   for pair_batch in train_loader:
     opt.zero_grad()
     pair_batch = pair_batch.to(device)
-    out, pool_edge_list_2, pool_edge_list_3, _, _, score_list_2, score_list_3 = model(
+    out = model(
         pair_batch.x_3, pair_batch.edge_index_3, pair_batch.pos_3,
-        pair_batch.x_2, pair_batch.edge_index_2, pair_batch.pos_2)
+        pair_batch.x_2, pair_batch.edge_index_2, pair_batch.pos_2,
+        pool_structures["ei2"], pool_structures["ei3"],
+        pool_structures["p2"], pool_structures["p2"])
 
     data_loss = loss_fn(out, pair_batch.x_3)
 
-    score_loss_2 = sum([
-        F.selu(-get_edge_attr(edge_index_2, score_2).square(),
-               inplace=True).sum()
-        for score_2, edge_index_2 in zip(score_list_2, pool_edge_list_2[:-1])
-    ])
+    # score_loss_2 = sum([
+    #     F.selu(-get_edge_attr(edge_index_2, score_2).square(),
+    #            inplace=True).sum()
+    #     for score_2, edge_index_2 in zip(score_list_2, pool_edge_list_2[:-1])
+    # ])
 
-    score_loss_3 = sum([
-        F.selu(-get_edge_attr(edge_index_3, score_3).square(),
-               inplace=True).sum()
-        for score_3, edge_index_3 in zip(score_list_3, pool_edge_list_3[:-1])
-    ])
+    # score_loss_3 = sum([
+    #     F.selu(-get_edge_attr(edge_index_3, score_3).square(),
+    #            inplace=True).sum()
+    #     for score_3, edge_index_3 in zip(score_list_3, pool_edge_list_3[:-1])
+    # ])
 
-    batch_loss = data_loss + lambda_2*score_loss_2 + lambda_3*score_loss_3
+    batch_loss = data_loss # + lambda_2*score_loss_2 + lambda_3*score_loss_3
 
     batch_loss.backward()
     # print(batch_loss)
