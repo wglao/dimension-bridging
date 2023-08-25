@@ -69,12 +69,12 @@ if wandb_upload:
   test_dataset = PairDataset(data_path, ma_list, [4e6, 7e6, 1e7], aoa_list,
                              "test", n_slices)
 else:
-  train_dataset = PairDataset(data_path, [0.3, 0.4], [3e6, 4e6], [3, 4],
-                              "idev-train", n_slices)
-  test_dataset = PairDataset(data_path, [0.5, 0.6], [5e6, 6e6], [5, 6],
-                             "idev-test", n_slices)
-  # train_dataset = PairDataset(data_path, [0.3], [3e6], [3], "recon", n_slices)
-  # test_dataset = PairDataset(data_path, [0.3], [3e6], [3], "recon", n_slices)
+  # train_dataset = PairDataset(data_path, [0.3, 0.4], [3e6, 4e6], [3, 4],
+  #                             "idev-train", n_slices)
+  # test_dataset = PairDataset(data_path, [0.5, 0.6], [5e6, 6e6], [5, 6],
+  #                            "idev-test", n_slices)
+  train_dataset = PairDataset(data_path, [0.3], [3e6], [3], "recon", n_slices)
+  test_dataset = PairDataset(data_path, [0.3], [3e6], [3], "recon", n_slices)
 
 n_samples = len(train_dataset)
 batch_sz = int(np.min(np.array([1, n_samples])))
@@ -96,7 +96,11 @@ pool_path = os.path.join(os.environ["SCRATCH"],
 if not os.path.exists(pool_path):
   os.makedirs(pool_path, exist_ok=True)
 
-saved_pool = bool(len(glob.glob(os.path.join(pool_path, "pool*.pt"))))
+saved_pool = bool(
+    len(
+        glob.glob(
+            os.path.join(pool_path,
+                         "pool*{:d}layers.pt".format(args.pooling_layers)))))
 
 if not saved_pool:
   with torch.no_grad():
@@ -153,7 +157,7 @@ if not saved_pool:
         for j in range(rows[i], rows[i + 1]):
           edges.append((cols[j], data[j]))
 
-      return torch.tensor(edges).transpose(0, 1)
+      return torch.tensor(edges).transpose(0, 1).int()
 
     def decimation_pool(x, edge_index, pos):
       n_nodes = x.size(0)
@@ -161,6 +165,7 @@ if not saved_pool:
                           (n_nodes, n_nodes))
       adj_list = [adj]
       pos_list = [pos]
+      keep_list = []
 
       for l in range(args.pooling_layers):
         if debug:
@@ -173,8 +178,9 @@ if not saved_pool:
         if gamma < 0.5:
           # random cut with z in {-1,1}
           z_vec = torch.where(torch.randint(0, 1, z_vec.size()) > 0, 1, -1)
-        keep_idx = torch.argwhere(z_vec.squeeze() > 0)
-        drop_idx = torch.argwhere(z_vec.squeeze() < 0)
+        keep_idx = torch.argwhere(z_vec.squeeze() > 0).squeeze().int()
+        drop_idx = torch.argwhere(z_vec.squeeze() < 0).squeeze().int()
+        keep_list.append(keep_idx)
 
         lapl_keep = lapl[np.ix_(keep_idx, keep_idx)]
         lapl_in_out = lapl[np.ix_(keep_idx, drop_idx)]
@@ -197,7 +203,7 @@ if not saved_pool:
           lapl_new = (lapl_new + lapl_new.T) / 2.
 
         adj_new = -lapl_new
-        adj_new.set_diag(0)
+        adj_new.setdiag(0)
         adj_new.eliminate_zeros()
         adj_list.append(adj_new)
 
@@ -208,33 +214,37 @@ if not saved_pool:
         adj = adj*np.abs(adj) > 1e-1
 
       edge_index_list = [get_edge_list(adj) for adj in adj_list]
-      return edge_index_list, pos_list
+      return edge_index_list, pos_list, keep_list
 
     # move to cpu for memory
     init_data.cpu().detach()
     if debug:
       print("Pooling 2D")
-    edge_index_list_2, pos_list_2 = decimation_pool(init_data.x_2,
-                                                    init_data.edge_index_2,
-                                                    init_data.pos_2)
+    edge_index_list_2, pos_list_2, keep_list_2 = decimation_pool(
+        init_data.x_2, init_data.edge_index_2, init_data.pos_2)
     if debug:
       print("Pooling 3D")
-    edge_index_list_3, pos_list_3 = decimation_pool(init_data.x_3,
-                                                    init_data.edge_index_3,
-                                                    init_data.pos_3)
+    edge_index_list_3, pos_list_3, keep_list_3 = decimation_pool(
+        init_data.x_3, init_data.edge_index_3, init_data.pos_3)
 
     pool_structures = {
         "ei2": edge_index_list_2,
         "ei3": edge_index_list_3,
         "p2": pos_list_2,
-        "p3": pos_list_3
+        "p3": pos_list_3,
+        "k2": keep_list_2,
+        "k3": keep_list_3
     }
 
-    torch.save(os.path.join(pool_path, "pool.pt"), pool_structures)
+    torch.save(
+        pool_structures,
+        os.path.join(pool_path,
+                     "pool_{:d}layers.pt".format(args.pooling_layers)))
 else:
   if debug:
     print("Loading pooled graphs")
-  pool_structures = torch.load(os.path.join(pool_path, "pool.pt"))
+  pool_structures = torch.load(
+      os.path.join(pool_path, "pool_{:d}layers.pt".format(args.pooling_layers)))
 
 if debug:
   print('Init')
@@ -273,8 +283,12 @@ def train_step():
     pair_batch = pair_batch.to(device)
     out = model(pair_batch.x_3, pair_batch.edge_index_3, pair_batch.pos_3,
                 pair_batch.x_2, pair_batch.edge_index_2, pair_batch.pos_2,
-                pool_structures["ei2"], pool_structures["ei3"],
-                pool_structures["p2"], pool_structures["p2"])
+                [a.to(device) for a in pool_structures["ei2"]],
+                [a.to(device) for a in pool_structures["ei3"]],
+                [a.to(device) for a in pool_structures["p2"]],
+                [a.to(device) for a in pool_structures["p3"]],
+                [a.to(device) for a in pool_structures["k2"]],
+                [a.to(device) for a in pool_structures["k3"]])
 
     data_loss = loss_fn(out, pair_batch.x_3)
 
@@ -312,9 +326,15 @@ def test_step():
     test_err = 0
     for pair_batch in train_loader:
       pair_batch = pair_batch.to(device)
-      out, _, _ = model(pair_batch.x_3, pair_batch.edge_index_3,
+      out = model(pair_batch.x_3, pair_batch.edge_index_3,
                         pair_batch.pos_3, pair_batch.x_2,
-                        pair_batch.edge_index_2, pair_batch.pos_2)
+                        pair_batch.edge_index_2, pair_batch.pos_2,
+                        [a.to(device) for a in pool_structures["ei2"]],
+                        [a.to(device) for a in pool_structures["ei3"]],
+                        [a.to(device) for a in pool_structures["p2"]],
+                        [a.to(device) for a in pool_structures["p3"]],
+                        [a.to(device) for a in pool_structures["k2"]],
+                        [a.to(device) for a in pool_structures["k3"]])
       batch_loss = loss_fn(out, pair_batch.x_3)
       test_err += batch_loss
     test_err /= test_batches

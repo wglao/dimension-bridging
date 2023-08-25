@@ -18,7 +18,7 @@ from torch_geometric.nn import MessagePassing, knn_interpolate
 from torch_geometric.nn import Sequential as GeoSequential
 from torch_geometric.nn.norm import BatchNorm
 from torch_geometric.nn.pool.topk_pool import filter_adj, topk
-from torch_geometric.nn.pool import max_pool, avg_pool_neighbor_x
+from torch_geometric.nn.pool import max_pool, avg_pool_neighbor_x, max_pool_neighbor_x
 from torch_geometric.utils import softmax, add_self_loops, add_remaining_self_loops
 from torch_geometric.utils import (
     is_torch_sparse_tensor,
@@ -83,8 +83,17 @@ def onera_transform(pos):
   return pos
 
 
-def onera_interp(f, pos_x, pos_y):
-  return knn_interpolate(f, onera_transform(pos_x), onera_transform(pos_y))
+def onera_interp(f, pos_x, pos_y, device: str = "cpu"):
+  in_idx = (pos_x[:, 1] < 1.1963, pos_y[:, 1] < 1.1963)
+  out_idx = (pos_x[:, 1] > 1.1963, pos_y[:, 1] > 1.1963)
+  inboard = knn_interpolate(f[in_idx[0]], onera_transform(pos_x[in_idx[0]]),
+                            onera_transform(pos_y[in_idx[1]]))
+  
+  outboard = knn_interpolate(f, pos_x, pos_y)[out_idx[1]]
+  out = torch.zeros((pos_y.size(0), f.size(1))).to(device)
+  out[in_idx[1]] = inboard
+  out[out_idx[1]] = outboard
+  return out
 
 
 class KernelMLP(nn.Module):
@@ -304,7 +313,7 @@ class Encoder(nn.Module):
     # pools
     self.pool_list = nn.ModuleList()
     for _ in range(n_pools):
-      # # MY NEIGHBORHOOD POOL
+      # MY NEIGHBORHOOD POOL
       self.pool_list.append(
           NeighborhoodPool(
               dim,
@@ -331,27 +340,49 @@ class Encoder(nn.Module):
             hidden_channels,
             device=device).to(self.device))
 
-  def forward(self, x, edge_index, pos):
+  def max_pool(self, x, edge_index, keep_idx):
+    data = Data(x, edge_index)
+    data = max_pool_neighbor_x(data)
+    out = data.x[keep_idx]
+    return out
+
+  def forward(self,
+              x,
+              edge_index,
+              pos,
+              pool_edge_index=None,
+              pool_pos=None,
+              pool_keep_idx=None):
+    ret = 0
+
     x = F.selu(self.lin0(x), inplace=True)
     x = F.selu((self.conv_list[0](torch.cat((x, pos), dim=1), edge_index, pos)),
                inplace=True)
     x = F.selu((self.conv_list[1](torch.cat((x, pos), dim=1), edge_index, pos)),
                inplace=True)
 
-    pool_edge_list = [edge_index]
-    pool_pos_list = [pos]
+    if pool_edge_index is None:
+      ret = 1
+      pool_edge_list = [edge_index]
+      pool_pos_list = [pos]
     if self.training:
       score_list = []
     for l, pool in enumerate(self.pool_list):
-      if self.training:
-        x, edge_index, pos, score = pool(x, edge_index, pos)
-      else:
-        x, edge_index, pos = pool(x, edge_index, pos)
+      # if pool_edge_index is not None:
+      # if self.training:
+      #   x, edge_index, pos, score = pool(x, edge_index, pos)
+      # else:
+      #   x, edge_index, pos = pool(x, edge_index, pos)
 
-      pool_edge_list.insert(0, edge_index)
-      pool_pos_list.insert(0, pos)
-      if self.training:
-        score_list.insert(0, score)
+      # pool_edge_list.insert(0, edge_index)
+      # pool_pos_list.insert(0, pos)
+      # if self.training:
+      #   score_list.insert(0, score)
+      keep_idx = pool_keep_idx[l]
+      x = self.max_pool(x, edge_index, keep_idx)
+      edge_index = pool_edge_index[l + 1]
+      pos = pool_pos[l + 1]
+
       x = F.selu((self.conv_list[l + 2](torch.cat(
           (x, pos), dim=1), edge_index, pos)),
                  inplace=True)
@@ -361,8 +392,14 @@ class Encoder(nn.Module):
                inplace=True)
     x = F.selu(self.lin1(x), inplace=True)
     if self.training:
-      return x, pool_edge_list, pool_pos_list, score_list
-    return x, pool_edge_list, pool_pos_list
+      if ret:
+        return x, pool_edge_list, pool_pos_list, score_list
+      else:
+        return x
+    if ret:
+      return x, pool_edge_list, pool_pos_list
+    else:
+      return x
 
 
 class StructureEncoder(Encoder):
@@ -493,7 +530,9 @@ class Decoder(nn.Module):
     # x = latent
     for l in range(self.n_pools):
       # deg = get_deg(x, edge_index, self.device)
-      x = self.interpolate(x, pos_list[l], pos_list[l + 1])
+      x = self.interpolate(x, pos_list[l], pos_list[l + 1], self.device)
+      if x.isnan().sum():
+        breakpoint()
       edge_index = edge_index_list[l + 1]
       pos = pos_list[l + 1]
       # WITH INITIAL AGG
@@ -509,8 +548,8 @@ class Decoder(nn.Module):
         self.conv_list[-1](torch.cat((x, pos), dim=1), edge_index, pos),
         inplace=True)
     out = self.lin1(out)
-    if out.isnan().sum():
-      breakpoint()
+    # if out.isnan().sum():
+    #   breakpoint()
     return out
 
 
@@ -563,7 +602,9 @@ class DBA(nn.Module):
               pool_edge_list_2=None,
               pool_edge_list_3=None,
               pool_pos_list_2=None,
-              pool_pos_list_3=None):
+              pool_pos_list_3=None,
+              pool_keep_list_2=None,
+              pool_keep_list_3=None):
     # scale data
     x_2 = (x_2 - x_2.min(dim=0).values) / (
         x_2.max(dim=0).values - x_2.min(dim=0).values)
@@ -575,7 +616,7 @@ class DBA(nn.Module):
         pos_3.max(dim=0).values - pos_3.min(dim=0).values)
 
     ret = 0
-    if pool_edge_list_2 is None and pool_pos_list_2 is None:
+    if pool_edge_list_2 is None and pool_pos_list_2 is None and pool_keep_list_2 is None:
       if self.training:
         latent_2, pool_edge_list_2, pool_pos_list_2, score_list_2 = self.encoder2D(
             x_2, edge_index_2, pos_2)
@@ -583,19 +624,16 @@ class DBA(nn.Module):
         latent_2, pool_edge_list_2, pool_pos_list_2 = self.encoder2D(
             x_2, edge_index_2, pos_2)
     else:
-      if self.training:
-        latent_2, _ = self.encoder2D(
-            x_2, pool_edge_list_2, pool_pos_list_2)
-      else:
-        latent_2 = self.encoder2D(
-            x_2, pool_edge_list_2, pool_pos_list_2)
+      latent_2 = self.encoder2D(x_2, edge_index_2, pos_2, pool_edge_list_2,
+                                pool_pos_list_2, pool_keep_list_2)
 
-    if pool_edge_list_3 is None and pool_pos_list_3 is None:
+    if pool_edge_list_3 is None and pool_pos_list_3 is None and pool_keep_list_3 is None:
       if self.training:
         pool_edge_list_3, pool_pos_list_3, score_list_3 = self.encoder3D(
             x_3, edge_index_3, pos_3)
       else:
-        pool_edge_list_3, pool_pos_list_3 = self.encoder3D(x_3, edge_index_3, pos_3)
+        pool_edge_list_3, pool_pos_list_3 = self.encoder3D(
+            x_3, edge_index_3, pos_3)
       ret = 1
       pool_edge_list_3.insert(0, pool_edge_list_2[0])
       pool_pos_list_3.insert(0, pool_pos_list_2[0])
@@ -603,11 +641,11 @@ class DBA(nn.Module):
       # pool_edge_list = [x.to(self.device) for x in pool_edge_list]
       # pool_pos_list = [x.to(self.device) for x in pool_pos_list]
     else:
-      # pool_edge_list.pop(0)
-      pool_edge_list_3.insert(0, pool_edge_list_2[-1])
+      pool_edge_list_3.append(pool_edge_list_2[-1])
+      pool_edge_list_3 = [a for a in reversed(pool_edge_list_3)]
 
-      # pool_pos_list.pop(0)
-      pool_pos_list_3.insert(0, pool_pos_list_2[-1])
+      pool_pos_list_3.append(pool_pos_list_2[-1])
+      pool_pos_list_3 = [a for a in reversed(pool_pos_list_3)]
 
       # pool_edge_list = [x.to(self.device) for x in pool_edge_list]
       # pool_pos_list = [x.to(self.device) for x in pool_pos_list]
@@ -616,8 +654,8 @@ class DBA(nn.Module):
 
     if ret == 1:
       if self.training:
-        return (out, pool_edge_list_2, pool_edge_list_3, pool_pos_list_2, pool_pos_list_3,
-                score_list_2, score_list_3)
+        return (out, pool_edge_list_2, pool_edge_list_3, pool_pos_list_2,
+                pool_pos_list_3, score_list_2, score_list_3)
       return out, pool_edge_list_2, pool_edge_list_3, pool_pos_list_2, pool_pos_list_3
     if self.training:
       return out
