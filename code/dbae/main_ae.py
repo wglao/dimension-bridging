@@ -280,6 +280,7 @@ def train_step():
   err = 0
   for pair_batch in train_loader:
     opt.zero_grad()
+
     pair_batch = pair_batch.to(device)
     out = model(pair_batch.x_3, pair_batch.edge_index_3, pair_batch.pos_3,
                 pair_batch.x_2, pair_batch.edge_index_2, pair_batch.pos_2,
@@ -315,6 +316,7 @@ def train_step():
 
     loss += batch_loss
     err += data_loss
+    del pair_batch, out, data_loss, batch_loss
   loss /= batches
   err /= batches
   return loss, err

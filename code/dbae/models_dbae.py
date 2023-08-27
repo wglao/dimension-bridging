@@ -1,5 +1,6 @@
 import torch
 import math
+from functools import partial
 from torch import Tensor
 from torch_geometric.nn.aggr import Aggregation
 from torch_geometric.typing import (
@@ -11,6 +12,7 @@ from torch_geometric.typing import (
 )
 from typing import Any, Dict, List, Tuple, Union, Optional, Callable
 from torch import nn
+from torch import vmap
 from torch_geometric.data import Batch, Data
 from torch_geometric.loader import ClusterData, ClusterLoader
 from torch_geometric.nn import SAGEConv, SAGPooling, GATv2Conv, GCNConv, GraphConv, GINConv, Linear
@@ -88,7 +90,7 @@ def onera_interp(f, pos_x, pos_y, device: str = "cpu"):
   out_idx = (pos_x[:, 1] > 1.1963, pos_y[:, 1] > 1.1963)
   inboard = knn_interpolate(f[in_idx[0]], onera_transform(pos_x[in_idx[0]]),
                             onera_transform(pos_y[in_idx[1]]))
-  
+
   outboard = knn_interpolate(f, pos_x, pos_y)[out_idx[1]]
   out = torch.zeros((pos_y.size(0), f.size(1))).to(device)
   out[in_idx[1]] = inboard
@@ -100,11 +102,15 @@ class KernelMLP(nn.Module):
 
   def __init__(self,
                dim: int,
+               in_channels: int,
                hidden_channels: int,
+               out_channels: int,
                device: str = "cpu") -> None:
     super(KernelMLP, self).__init__()
     self.dim = dim
+    self.in_channels = in_channels
     self.hidden_channels = hidden_channels
+    self.out_channels = out_channels
     self.device = device
 
     self.lin0 = Linear(
@@ -113,7 +119,8 @@ class KernelMLP(nn.Module):
     #     hidden_channels, hidden_channels,
     #     weight_initializer='glorot').to(device)
     self.lin2 = Linear(
-        hidden_channels, 1, weight_initializer='glorot').to(device)
+        hidden_channels, in_channels*out_channels,
+        weight_initializer='glorot').to(device)
 
     self.reset_parameters()
 
@@ -123,9 +130,18 @@ class KernelMLP(nn.Module):
     self.lin2.reset_parameters()
 
   def forward(self, rel_pos):
+    # # Convert to spherical [rho, theta, phi] = [r, az, elev]
+    rho = torch.norm(rel_pos, dim=1)
+    theta = torch.atan2(rel_pos[:, 1], rel_pos[:, 0])
+    phi = torch.asin(rel_pos[:, 2] / rho)
+    theta = torch.where(phi.isnan(), torch.zeros_like(theta), theta)
+    phi = torch.where(phi.isnan(), torch.zeros_like(phi), phi)
+    rel_pos = torch.stack((rho, theta / torch.pi, phi / torch.pi), dim=1)
+
     out = F.selu(self.lin0(rel_pos), inplace=True)
     # out = F.selu(self.lin1(out), inplace=True)
     out = self.lin2(out)
+    out = out.reshape((self.out_channels, out.size(0), self.in_channels))
     return out
 
 
@@ -146,35 +162,38 @@ class GraphKernelConv(MessagePassing):
     self.hidden_channels = hidden_channels
     self.out_channels = out_channels
     self.device = device
+    self.k_net = k_net(dim, in_channels, dim, out_channels,
+                       device).to(device)
+    # self.lin0 = Linear(in_channels, out_channels).to(device)
+    # self.lin1 = Linear(hidden_channels, out_channels).to(device)
 
-    self.k_net = k_net(dim, hidden_channels, device).to(device)
-    self.lin0 = Linear(in_channels, hidden_channels).to(device)
-    self.lin1 = Linear(hidden_channels, out_channels).to(device)
-
-    self.bias = Parameter(torch.Tensor(out_channels)).to(device)
+    self.bias = Parameter(torch.Tensor(1,out_channels)).to(device)
 
     self.reset_parameters()
 
   def reset_parameters(self):
     super().reset_parameters()
     self.k_net.reset_parameters()
-    self.lin0.reset_parameters()
-    self.lin1.reset_parameters()
+    # self.lin0.reset_parameters()
+    # self.lin1.reset_parameters()
     zeros(self.bias)
     self._cached_edge_index = None
 
   def forward(self, x, edge_index, pos):
-    x = F.selu(self.lin0(x), inplace=True)
+    # x = F.selu(self.lin0(x), inplace=True)
     edge_index, _ = add_remaining_self_loops(edge_index)
-    edge_weight = self.k_net(get_edge_attr(edge_index, pos))
-
-    out = self.propagate(edge_index, x=x, edge_weight=edge_weight, size=None)
-    out = self.lin1(out)
+    rel_pos = get_edge_attr(edge_index, pos)
+    out = self.propagate(edge_index, x=x, edge_weight=rel_pos, size=None)
+    # out = self.lin1(out)
+    out = out.squeeze() + self.bias
 
     return out
 
   def message(self, x_j: Tensor, edge_weight: OptTensor) -> Tensor:
-    return x_j if edge_weight is None else edge_weight.view(-1, 1)*x_j
+    msg = x_j if edge_weight is None else torch.squeeze(vmap(
+        lambda a, b: self.k_net(a.unsqueeze(0)) @ b, in_dims=(0, 0))(
+            edge_weight, x_j).squeeze())
+    return msg
 
   def message_and_aggregate(self, adj_t: SparseTensor, x: Tensor) -> Tensor:
     return spmm(adj_t, x, reduce=self.aggr)
@@ -302,25 +321,25 @@ class Encoder(nn.Module):
             hidden_channels,
             device=device).to(self.device)
     ])
-    self.conv_list.append(
-        GraphKernelConv(
-            dim,
-            hidden_channels + dim,
-            hidden_channels,
-            hidden_channels,
-            device=device).to(self.device))
+    # self.conv_list.append(
+    #     GraphKernelConv(
+    #         dim,
+    #         hidden_channels + dim,
+    #         hidden_channels,
+    #         hidden_channels,
+    #         device=device).to(self.device))
 
     # pools
     self.pool_list = nn.ModuleList()
     for _ in range(n_pools):
       # MY NEIGHBORHOOD POOL
-      self.pool_list.append(
-          NeighborhoodPool(
-              dim,
-              hidden_channels,
-              self.k_hops,
-              device=device,
-          ).to(device))
+      # self.pool_list.append(
+      #     NeighborhoodPool(
+      #         dim,
+      #         hidden_channels,
+      #         self.k_hops,
+      #         device=device,
+      #     ).to(device))
 
       self.conv_list.append(
           GraphKernelConv(
@@ -332,13 +351,13 @@ class Encoder(nn.Module):
 
     # latent
     # out_sz = get_pooled_sz(init_data.num_nodes, k_hops, n_pools)
-    self.conv_list.append(
-        GraphKernelConv(
-            dim,
-            hidden_channels + dim,
-            hidden_channels,
-            hidden_channels,
-            device=device).to(self.device))
+    # self.conv_list.append(
+    #     GraphKernelConv(
+    #         dim,
+    #         hidden_channels + dim,
+    #         hidden_channels,
+    #         hidden_channels,
+    #         device=device).to(self.device))
 
   def max_pool(self, x, edge_index, keep_idx):
     data = Data(x, edge_index)
@@ -358,8 +377,8 @@ class Encoder(nn.Module):
     x = F.selu(self.lin0(x), inplace=True)
     x = F.selu((self.conv_list[0](torch.cat((x, pos), dim=1), edge_index, pos)),
                inplace=True)
-    x = F.selu((self.conv_list[1](torch.cat((x, pos), dim=1), edge_index, pos)),
-               inplace=True)
+    # x = F.selu((self.conv_list[1](torch.cat((x, pos), dim=1), edge_index, pos)),
+    #            inplace=True)
 
     if pool_edge_index is None:
       ret = 1
@@ -367,7 +386,9 @@ class Encoder(nn.Module):
       pool_pos_list = [pos]
     if self.training:
       score_list = []
-    for l, pool in enumerate(self.pool_list):
+
+    # for l, pool in enumerate(self.pool_list):
+    for l in range(self.n_pools):
       # if pool_edge_index is not None:
       # if self.training:
       #   x, edge_index, pos, score = pool(x, edge_index, pos)
@@ -383,14 +404,15 @@ class Encoder(nn.Module):
       edge_index = pool_edge_index[l + 1]
       pos = pool_pos[l + 1]
 
-      x = F.selu((self.conv_list[l + 2](torch.cat(
+      x = F.selu((self.conv_list[l + 1](torch.cat(
           (x, pos), dim=1), edge_index, pos)),
                  inplace=True)
 
-    x = F.selu((self.conv_list[-1](torch.cat(
-        (x, pos), dim=1), edge_index, pos)),
-               inplace=True)
+    # x = F.selu((self.conv_list[-1](torch.cat(
+    #     (x, pos), dim=1), edge_index, pos)),
+    #            inplace=True)
     x = F.selu(self.lin1(x), inplace=True)
+
     if self.training:
       if ret:
         return x, pool_edge_list, pool_pos_list, score_list
@@ -487,13 +509,13 @@ class Decoder(nn.Module):
             device=device).to(self.device)
     ])
 
-    self.conv_list.append(
-        GraphKernelConv(
-            dim,
-            hidden_channels + dim,
-            hidden_channels,
-            hidden_channels,
-            device=device).to(self.device))
+    # self.conv_list.append(
+    #     GraphKernelConv(
+    #         dim,
+    #         hidden_channels + dim,
+    #         hidden_channels,
+    #         hidden_channels,
+    #         device=device).to(self.device))
 
     # # no initial aggr
     # self.conv_list = nn.ModuleList()
@@ -508,21 +530,21 @@ class Decoder(nn.Module):
               hidden_channels,
               device=device).to(self.device))
 
-    self.conv_list.append(
-        GraphKernelConv(
-            dim,
-            hidden_channels + dim,
-            hidden_channels,
-            hidden_channels,
-            device=device).to(self.device))
+    # self.conv_list.append(
+    #     GraphKernelConv(
+    #         dim,
+    #         hidden_channels + dim,
+    #         hidden_channels,
+    #         hidden_channels,
+    #         device=device).to(self.device))
 
   def forward(self, latent, edge_index_list, pos_list):
     # INITIAL AGG
     x = F.selu((self.lin0(latent)), inplace=True)
-    # edge_index = edge_index_list[0]
-    # pos = pos_list[0]
-    # x = F.selu((self.conv_list[0](torch.cat((x, pos), dim=1), edge_index, pos)),
-    #            inplace=True)
+    edge_index = edge_index_list[0]
+    pos = pos_list[0]
+    x = F.selu((self.conv_list[0](torch.cat((x, pos), dim=1), edge_index, pos)),
+               inplace=True)
     # x = F.selu((self.conv_list[1](torch.cat((x, pos), dim=1), edge_index, pos)),
     #            inplace=True)
 
@@ -536,7 +558,7 @@ class Decoder(nn.Module):
       edge_index = edge_index_list[l + 1]
       pos = pos_list[l + 1]
       # WITH INITIAL AGG
-      x = F.selu((self.conv_list[l + 2](torch.cat(
+      x = F.selu((self.conv_list[l](torch.cat(
           (x, pos), dim=1), edge_index, pos)),
                  inplace=True)
 
@@ -544,10 +566,10 @@ class Decoder(nn.Module):
       # x = F.selu(
       #     self.conv_list[l](torch.cat((x, pos), dim=1), edge_index, pos),
       #     inplace=True)
-    out = F.selu(
-        self.conv_list[-1](torch.cat((x, pos), dim=1), edge_index, pos),
-        inplace=True)
-    out = self.lin1(out)
+    # out = F.selu(
+    #     self.conv_list[-1](torch.cat((x, pos), dim=1), edge_index, pos),
+    #     inplace=True)
+    out = self.lin1(x)
     # if out.isnan().sum():
     #   breakpoint()
     return out
