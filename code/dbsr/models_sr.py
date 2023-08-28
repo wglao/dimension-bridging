@@ -119,32 +119,53 @@ class KernelMLP(nn.Module):
 
   def __init__(self,
                dim: int,
+               in_channels: int,
                hidden_channels: int,
+               out_channels: int,
                device: str = "cpu") -> None:
     super(KernelMLP, self).__init__()
     self.dim = dim
+    self.in_channels = in_channels
     self.hidden_channels = hidden_channels
+    self.out_channels = out_channels
     self.device = device
 
+    # in size is [n, dim + 1] for channel number
     self.lin0 = Linear(
-        dim, hidden_channels, weight_initializer='glorot').to(device)
-    self.lin1 = Linear(
-        hidden_channels, hidden_channels,
-        weight_initializer='glorot').to(device)
+        dim + 1, hidden_channels, weight_initializer='glorot').to(device)
+    # self.lin1 = Linear(
+    #     hidden_channels, hidden_channels,
+    #     weight_initializer='glorot').to(device)
     self.lin2 = Linear(
-        hidden_channels, 1, weight_initializer='glorot').to(device)
+        hidden_channels, in_channels, weight_initializer='glorot').to(device)
 
     self.reset_parameters()
 
   def reset_parameters(self):
+    self.lin0 = self.lin0.to(self.device)
     self.lin0.reset_parameters()
-    self.lin1.reset_parameters()
+    # self.lin1.reset_parameters()
+    self.lin2 = self.lin2.to(self.device)
     self.lin2.reset_parameters()
 
-  def forward(self, rel_pos):
-    out = F.selu(self.lin0(rel_pos), inplace=True)
-    out = F.selu(self.lin1(out), inplace=True)
+  def forward(self, rel_pos, channel: int = 0):
+    # # Convert to spherical [rho, theta, phi] = [r, az, elev]
+    breakpoint()
+    rho = torch.norm(rel_pos, dim=1)
+    theta = torch.atan2(rel_pos[:, 1], rel_pos[:, 0])
+    phi = torch.asin(rel_pos[:, 2] / rho)
+    theta = torch.where(phi.isnan(), torch.zeros_like(theta), theta)
+    phi = torch.where(phi.isnan(), torch.zeros_like(phi), phi)
+
+    rel_pos = torch.stack((rho, theta / torch.pi, phi / torch.pi), dim=1)
+    out = F.selu(
+        self.lin0(
+            torch.cat((rel_pos, torch.full_like(rho, channel).unsqueeze(1)),
+                      1)),
+        inplace=True)
+    # out = F.selu(self.lin1(out), inplace=True)
     out = self.lin2(out)
+    # out = out.reshape((self.out_channels, out.size(0), self.in_channels))
     return out
 
 
@@ -165,35 +186,50 @@ class GraphKernelConv(MessagePassing):
     self.hidden_channels = hidden_channels
     self.out_channels = out_channels
     self.device = device
+    # self.k_net = k_net(dim, in_channels, hidden_channels, out_channels,
+    #                    device).to(device)
+    self.k_net = k_net(dim, in_channels, hidden_channels, out_channels,
+                       "cpu")
+    # self.lin0 = Linear(in_channels, out_channels).to(device)
+    # self.lin1 = Linear(hidden_channels, out_channels).to(device)
 
-    self.k_net = k_net(dim, hidden_channels, device).to(device)
-    self.lin0 = Linear(in_channels, hidden_channels).to(device)
-    self.lin1 = Linear(hidden_channels, out_channels).to(device)
-
-    self.bias = Parameter(torch.Tensor(out_channels)).to(device)
+    self.bias = Parameter(torch.Tensor(1, out_channels)).to(device)
 
     self.reset_parameters()
 
   def reset_parameters(self):
     super().reset_parameters()
+    self.k_net = self.k_net.to(self.k_net.device)
     self.k_net.reset_parameters()
-    self.lin0.reset_parameters()
-    self.lin1.reset_parameters()
+    # self.lin0.reset_parameters()
+    # self.lin1.reset_parameters()
+    self.bias = self.bias.to(self.device)
     zeros(self.bias)
-    self._cached_edge_index = None
+    # self._cached_edge_index = None
 
   def forward(self, x, edge_index, pos):
-    x = F.selu(self.lin0(x), inplace=True)
+    # x = F.selu(self.lin0(x), inplace=True)
     edge_index, _ = add_remaining_self_loops(edge_index)
-    edge_weight = self.k_net(get_edge_attr(edge_index, pos))
+    rel_pos = get_edge_attr(edge_index, pos)
 
-    out = self.propagate(edge_index, x=x, edge_weight=edge_weight, size=None)
-    out = self.lin1(out)
+    out = self.propagate(edge_index, x=x, edge_weight=rel_pos, size=None)
+    # out = self.lin1(out)
+    out = out.squeeze() + self.bias
 
     return out
 
+  def message_calc(self, x_j: Tensor, rel_pos: Tensor, channel: int = 0):
+    msg = self.k_net(rel_pos.cpu(), channel) * x_j.cpu()
+    return msg.sum(1).to(self.device)
+
   def message(self, x_j: Tensor, edge_weight: OptTensor) -> Tensor:
-    return x_j if edge_weight is None else edge_weight.view(-1, 1)*x_j
+    if edge_weight is None:
+      msg = x_j
+    else:
+      msg = []
+      for i in range(self.out_channels):
+        msg.append(self.message_calc(x_j, edge_weight, i))
+    return torch.stack(msg, 1)
 
   def message_and_aggregate(self, adj_t: SparseTensor, x: Tensor) -> Tensor:
     return spmm(adj_t, x, reduce=self.aggr)

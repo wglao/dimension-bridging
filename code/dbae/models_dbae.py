@@ -113,35 +113,42 @@ class KernelMLP(nn.Module):
     self.out_channels = out_channels
     self.device = device
 
+    # in size is [n, dim + 1] for channel number
     self.lin0 = Linear(
-        dim, hidden_channels, weight_initializer='glorot').to(device)
+        dim + 1, hidden_channels, weight_initializer='glorot').to(device)
     # self.lin1 = Linear(
     #     hidden_channels, hidden_channels,
     #     weight_initializer='glorot').to(device)
     self.lin2 = Linear(
-        hidden_channels, in_channels*out_channels,
-        weight_initializer='glorot').to(device)
+        hidden_channels, in_channels, weight_initializer='glorot').to(device)
 
     self.reset_parameters()
 
   def reset_parameters(self):
+    self.lin0 = self.lin0.to(self.device)
     self.lin0.reset_parameters()
     # self.lin1.reset_parameters()
+    self.lin2 = self.lin2.to(self.device)
     self.lin2.reset_parameters()
 
-  def forward(self, rel_pos):
+  def forward(self, rel_pos, channel: int = 0):
     # # Convert to spherical [rho, theta, phi] = [r, az, elev]
+    breakpoint()
     rho = torch.norm(rel_pos, dim=1)
     theta = torch.atan2(rel_pos[:, 1], rel_pos[:, 0])
     phi = torch.asin(rel_pos[:, 2] / rho)
     theta = torch.where(phi.isnan(), torch.zeros_like(theta), theta)
     phi = torch.where(phi.isnan(), torch.zeros_like(phi), phi)
-    rel_pos = torch.stack((rho, theta / torch.pi, phi / torch.pi), dim=1)
 
-    out = F.selu(self.lin0(rel_pos), inplace=True)
+    rel_pos = torch.stack((rho, theta / torch.pi, phi / torch.pi), dim=1)
+    out = F.selu(
+        self.lin0(
+            torch.cat((rel_pos, torch.full_like(rho, channel).unsqueeze(1)),
+                      1)),
+        inplace=True)
     # out = F.selu(self.lin1(out), inplace=True)
     out = self.lin2(out)
-    out = out.reshape((self.out_channels, out.size(0), self.in_channels))
+    # out = out.reshape((self.out_channels, out.size(0), self.in_channels))
     return out
 
 
@@ -162,38 +169,50 @@ class GraphKernelConv(MessagePassing):
     self.hidden_channels = hidden_channels
     self.out_channels = out_channels
     self.device = device
-    self.k_net = k_net(dim, in_channels, dim, out_channels,
-                       device).to(device)
+    # self.k_net = k_net(dim, in_channels, hidden_channels, out_channels,
+    #                    device).to(device)
+    self.k_net = k_net(dim, in_channels, hidden_channels, out_channels,
+                       "cpu")
     # self.lin0 = Linear(in_channels, out_channels).to(device)
     # self.lin1 = Linear(hidden_channels, out_channels).to(device)
 
-    self.bias = Parameter(torch.Tensor(1,out_channels)).to(device)
+    self.bias = Parameter(torch.Tensor(1, out_channels)).to(device)
 
     self.reset_parameters()
 
   def reset_parameters(self):
     super().reset_parameters()
+    self.k_net = self.k_net.to(self.k_net.device)
     self.k_net.reset_parameters()
     # self.lin0.reset_parameters()
     # self.lin1.reset_parameters()
+    self.bias = self.bias.to(self.device)
     zeros(self.bias)
-    self._cached_edge_index = None
+    # self._cached_edge_index = None
 
   def forward(self, x, edge_index, pos):
     # x = F.selu(self.lin0(x), inplace=True)
     edge_index, _ = add_remaining_self_loops(edge_index)
     rel_pos = get_edge_attr(edge_index, pos)
+
     out = self.propagate(edge_index, x=x, edge_weight=rel_pos, size=None)
     # out = self.lin1(out)
     out = out.squeeze() + self.bias
 
     return out
 
+  def message_calc(self, x_j: Tensor, rel_pos: Tensor, channel: int = 0):
+    msg = self.k_net(rel_pos.cpu(), channel) * x_j.cpu()
+    return msg.sum(1).to(self.device)
+
   def message(self, x_j: Tensor, edge_weight: OptTensor) -> Tensor:
-    msg = x_j if edge_weight is None else torch.squeeze(vmap(
-        lambda a, b: self.k_net(a.unsqueeze(0)) @ b, in_dims=(0, 0))(
-            edge_weight, x_j).squeeze())
-    return msg
+    if edge_weight is None:
+      msg = x_j
+    else:
+      msg = []
+      for i in range(self.out_channels):
+        msg.append(self.message_calc(x_j, edge_weight, i))
+    return torch.stack(msg, 1)
 
   def message_and_aggregate(self, adj_t: SparseTensor, x: Tensor) -> Tensor:
     return spmm(adj_t, x, reduce=self.aggr)
@@ -358,6 +377,17 @@ class Encoder(nn.Module):
     #         hidden_channels,
     #         hidden_channels,
     #         device=device).to(self.device))
+  
+  def reset_parameters(self):
+    self.lin0 = self.lin0.to(self.device)
+    self.lin0.reset_parameters()
+    self.lin1 = self.lin1.to(self.device)
+    self.lin1.reset_parameters()
+
+    reset_list = [mod.to(mod.device) for mod in self.conv_list]
+    self.conv_list = nn.ModuleList(reset_list)
+    for conv in self.conv_list:
+      conv.reset_parameters()
 
   def max_pool(self, x, edge_index, keep_idx):
     data = Data(x, edge_index)
@@ -372,7 +402,7 @@ class Encoder(nn.Module):
               pool_edge_index=None,
               pool_pos=None,
               pool_keep_idx=None):
-    ret = 0
+    # ret = 0
 
     x = F.selu(self.lin0(x), inplace=True)
     x = F.selu((self.conv_list[0](torch.cat((x, pos), dim=1), edge_index, pos)),
@@ -380,12 +410,12 @@ class Encoder(nn.Module):
     # x = F.selu((self.conv_list[1](torch.cat((x, pos), dim=1), edge_index, pos)),
     #            inplace=True)
 
-    if pool_edge_index is None:
-      ret = 1
-      pool_edge_list = [edge_index]
-      pool_pos_list = [pos]
-    if self.training:
-      score_list = []
+    # if pool_edge_index is None:
+    #   ret = 1
+    #   pool_edge_list = [edge_index]
+    #   pool_pos_list = [pos]
+    # if self.training:
+    #   score_list = []
 
     # for l, pool in enumerate(self.pool_list):
     for l in range(self.n_pools):
@@ -413,15 +443,15 @@ class Encoder(nn.Module):
     #            inplace=True)
     x = F.selu(self.lin1(x), inplace=True)
 
-    if self.training:
-      if ret:
-        return x, pool_edge_list, pool_pos_list, score_list
-      else:
-        return x
-    if ret:
-      return x, pool_edge_list, pool_pos_list
-    else:
-      return x
+    # if self.training:
+    #   if ret:
+    #     return x, pool_edge_list, pool_pos_list, score_list
+    #   else:
+    #     return x
+    # if ret:
+    #   return x, pool_edge_list, pool_pos_list
+    # else:
+    return x
 
 
 class StructureEncoder(Encoder):
@@ -538,6 +568,19 @@ class Decoder(nn.Module):
     #         hidden_channels,
     #         device=device).to(self.device))
 
+    self.reset_parameters()
+
+  def reset_parameters(self):
+    self.lin0 = self.lin0.to(self.device)
+    self.lin0.reset_parameters()
+    self.lin1 = self.lin1.to(self.device)
+    self.lin1.reset_parameters()
+
+    reset_list = [mod.to(mod.device) for mod in self.conv_list]
+    self.conv_list = nn.ModuleList(reset_list)
+    for conv in self.conv_list:
+      conv.reset_parameters()
+
   def forward(self, latent, edge_index_list, pos_list):
     # INITIAL AGG
     x = F.selu((self.lin0(latent)), inplace=True)
@@ -597,8 +640,8 @@ class DBA(nn.Module):
     # only used for getting pooling structure
     init_data_3 = Data(
         x=init_data.x_3, edge_index=init_data.edge_index_3, pos=init_data.pos_3)
-    self.encoder3D = StructureEncoder(dim, init_data_3, hidden_channels,
-                                      latent_channels, n_pools, k_hops, device)
+    # self.encoder3D = StructureEncoder(dim, init_data_3, hidden_channels,
+    #                                   latent_channels, n_pools, k_hops, device)
 
     # used for model eval
     init_data_2 = Data(
@@ -613,6 +656,15 @@ class DBA(nn.Module):
         n_pools + 1,
         k_hops,
         device=device).to(self.device)
+    
+    self.reset_parameters()
+    
+  def reset_parameters(self):
+    self.encoder2D = self.encoder2D.to(self.encoder2D.device)
+    self.encoder2D.reset_parameters()
+
+    self.decoder = self.decoder.to(self.decoder.device)
+    self.decoder.reset_parameters()
 
   def forward(self,
               x_3,
@@ -638,47 +690,47 @@ class DBA(nn.Module):
         pos_3.max(dim=0).values - pos_3.min(dim=0).values)
 
     ret = 0
-    if pool_edge_list_2 is None and pool_pos_list_2 is None and pool_keep_list_2 is None:
-      if self.training:
-        latent_2, pool_edge_list_2, pool_pos_list_2, score_list_2 = self.encoder2D(
-            x_2, edge_index_2, pos_2)
-      else:
-        latent_2, pool_edge_list_2, pool_pos_list_2 = self.encoder2D(
-            x_2, edge_index_2, pos_2)
-    else:
-      latent_2 = self.encoder2D(x_2, edge_index_2, pos_2, pool_edge_list_2,
-                                pool_pos_list_2, pool_keep_list_2)
+    # if pool_edge_list_2 is None and pool_pos_list_2 is None and pool_keep_list_2 is None:
+    #   if self.training:
+    #     latent_2, pool_edge_list_2, pool_pos_list_2, score_list_2 = self.encoder2D(
+    #         x_2, edge_index_2, pos_2)
+    #   else:
+    #     latent_2, pool_edge_list_2, pool_pos_list_2 = self.encoder2D(
+    #         x_2, edge_index_2, pos_2)
+    # else:
+    latent_2 = self.encoder2D(x_2, edge_index_2, pos_2, pool_edge_list_2,
+                              pool_pos_list_2, pool_keep_list_2)
 
-    if pool_edge_list_3 is None and pool_pos_list_3 is None and pool_keep_list_3 is None:
-      if self.training:
-        pool_edge_list_3, pool_pos_list_3, score_list_3 = self.encoder3D(
-            x_3, edge_index_3, pos_3)
-      else:
-        pool_edge_list_3, pool_pos_list_3 = self.encoder3D(
-            x_3, edge_index_3, pos_3)
-      ret = 1
-      pool_edge_list_3.insert(0, pool_edge_list_2[0])
-      pool_pos_list_3.insert(0, pool_pos_list_2[0])
+    # if pool_edge_list_3 is None and pool_pos_list_3 is None and pool_keep_list_3 is None:
+    #   if self.training:
+    #     pool_edge_list_3, pool_pos_list_3, score_list_3 = self.encoder3D(
+    #         x_3, edge_index_3, pos_3)
+    #   else:
+    #     pool_edge_list_3, pool_pos_list_3 = self.encoder3D(
+    #         x_3, edge_index_3, pos_3)
+    #   ret = 1
+    #   pool_edge_list_3.insert(0, pool_edge_list_2[0])
+    #   pool_pos_list_3.insert(0, pool_pos_list_2[0])
 
-      # pool_edge_list = [x.to(self.device) for x in pool_edge_list]
-      # pool_pos_list = [x.to(self.device) for x in pool_pos_list]
-    else:
-      pool_edge_list_3.append(pool_edge_list_2[-1])
-      pool_edge_list_3 = [a for a in reversed(pool_edge_list_3)]
+    #   # pool_edge_list = [x.to(self.device) for x in pool_edge_list]
+    #   # pool_pos_list = [x.to(self.device) for x in pool_pos_list]
+    # else:
+    pool_edge_list_3.append(pool_edge_list_2[-1])
+    pool_edge_list_3 = [a for a in reversed(pool_edge_list_3)]
 
-      pool_pos_list_3.append(pool_pos_list_2[-1])
-      pool_pos_list_3 = [a for a in reversed(pool_pos_list_3)]
+    pool_pos_list_3.append(pool_pos_list_2[-1])
+    pool_pos_list_3 = [a for a in reversed(pool_pos_list_3)]
 
-      # pool_edge_list = [x.to(self.device) for x in pool_edge_list]
-      # pool_pos_list = [x.to(self.device) for x in pool_pos_list]
+    # pool_edge_list = [x.to(self.device) for x in pool_edge_list]
+    # pool_pos_list = [x.to(self.device) for x in pool_pos_list]
 
     out = self.decoder(latent_2, pool_edge_list_3, pool_pos_list_3)
 
-    if ret == 1:
-      if self.training:
-        return (out, pool_edge_list_2, pool_edge_list_3, pool_pos_list_2,
-                pool_pos_list_3, score_list_2, score_list_3)
-      return out, pool_edge_list_2, pool_edge_list_3, pool_pos_list_2, pool_pos_list_3
-    if self.training:
-      return out
+    # if ret == 1:
+    #   if self.training:
+    #     return (out, pool_edge_list_2, pool_edge_list_3, pool_pos_list_2,
+    #             pool_pos_list_3, score_list_2, score_list_3)
+    #   return out, pool_edge_list_2, pool_edge_list_3, pool_pos_list_2, pool_pos_list_3
+    # if self.training:
+    #   return out
     return out
