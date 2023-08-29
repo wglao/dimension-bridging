@@ -252,8 +252,17 @@ if debug:
 n_epochs = 10000
 eps = 1e-15
 
-model = DBA(3, init_data, args.channels, args.latent_sz, args.pooling_layers,
-            k_hops, device).to(device)
+with torch.no_grad():
+  model = torch.jit.trace(DBA(3, init_data, args.channels, args.latent_sz, args.pooling_layers,
+              k_hops, device).to(device),
+              (init_data.x_3, init_data.edge_index_3, init_data.pos_3,
+                init_data.x_2, init_data.edge_index_2, init_data.pos_2,
+                [a.to(device) for a in pool_structures["ei2"]],
+                [a.to(device) for a in pool_structures["ei3"]],
+                [a.to(device) for a in pool_structures["p2"]],
+                [a.to(device) for a in pool_structures["p3"]],
+                [a.to(device) for a in pool_structures["k2"]],
+                [a.to(device) for a in pool_structures["k3"]]))
 opt = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 sch = torch.optim.lr_scheduler.LinearLR(opt, 1, 1e-2, 1000)
 # sch = torch.optim.lr_scheduler.ExponentialLR(opt,args.decay)
@@ -342,7 +351,7 @@ def test_step():
     test_err /= test_batches
   return test_err
 
-
+@torch.jit.script
 def main(n_epochs):
   min_err = torch.inf
   save = os.path.join(save_path, "model_init")

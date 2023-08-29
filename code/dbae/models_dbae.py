@@ -86,15 +86,16 @@ def onera_transform(pos):
 
 
 def onera_interp(f, pos_x, pos_y, device: str = "cpu"):
-  in_idx = (pos_x[:, 1] < 1.1963, pos_y[:, 1] < 1.1963)
-  out_idx = (pos_x[:, 1] > 1.1963, pos_y[:, 1] > 1.1963)
-  inboard = knn_interpolate(f[in_idx[0]], onera_transform(pos_x[in_idx[0]]),
-                            onera_transform(pos_y[in_idx[1]]))
+  # in_idx = (pos_x[:, 1] < 1.1963, pos_y[:, 1] < 1.1963)
+  # out_idx = (pos_x[:, 1] > 1.1963, pos_y[:, 1] > 1.1963)
+  # inboard = knn_interpolate(f[in_idx[0]], onera_transform(pos_x[in_idx[0]]),
+  #                           onera_transform(pos_y[in_idx[1]]))
 
-  outboard = knn_interpolate(f, pos_x, pos_y)[out_idx[1]]
-  out = torch.zeros((pos_y.size(0), f.size(1))).to(device)
-  out[in_idx[1]] = inboard
-  out[out_idx[1]] = outboard
+  # outboard = knn_interpolate(f, pos_x, pos_y)[out_idx[1]]
+  out = torch.where((pos_y[:, 1] < 1.1963).reshape(pos_y.shape),
+                    knn_interpolate(f, onera_transform(pos_x),
+                                    onera_transform(pos_y)),
+                    knn_interpolate(f, pos_x, pos_y))
   return out
 
 
@@ -133,7 +134,6 @@ class KernelMLP(nn.Module):
 
   def forward(self, rel_pos, channel: int = 0):
     # # Convert to spherical [rho, theta, phi] = [r, az, elev]
-    breakpoint()
     rho = torch.norm(rel_pos, dim=1)
     theta = torch.atan2(rel_pos[:, 1], rel_pos[:, 0])
     phi = torch.asin(rel_pos[:, 2] / rho)
@@ -142,12 +142,11 @@ class KernelMLP(nn.Module):
 
     rel_pos = torch.stack((rho, theta / torch.pi, phi / torch.pi), dim=1)
     out = F.selu(
-        self.lin0(
-            torch.cat((rel_pos, torch.full_like(rho, channel).unsqueeze(1)),
-                      1)),
+        self.lin0.cpu()(torch.cat(
+            (rel_pos, torch.full_like(rho, channel).unsqueeze(1)), 1)),
         inplace=True)
     # out = F.selu(self.lin1(out), inplace=True)
-    out = self.lin2(out)
+    out = self.lin2.cpu()(out)
     # out = out.reshape((self.out_channels, out.size(0), self.in_channels))
     return out
 
@@ -169,10 +168,8 @@ class GraphKernelConv(MessagePassing):
     self.hidden_channels = hidden_channels
     self.out_channels = out_channels
     self.device = device
-    # self.k_net = k_net(dim, in_channels, hidden_channels, out_channels,
-    #                    device).to(device)
     self.k_net = k_net(dim, in_channels, hidden_channels, out_channels,
-                       "cpu")
+                       device).to(device)
     # self.lin0 = Linear(in_channels, out_channels).to(device)
     # self.lin1 = Linear(hidden_channels, out_channels).to(device)
 
@@ -202,7 +199,7 @@ class GraphKernelConv(MessagePassing):
     return out
 
   def message_calc(self, x_j: Tensor, rel_pos: Tensor, channel: int = 0):
-    msg = self.k_net(rel_pos.cpu(), channel) * x_j.cpu()
+    msg = self.k_net(rel_pos.cpu(), channel)*x_j.cpu()
     return msg.sum(1).to(self.device)
 
   def message(self, x_j: Tensor, edge_weight: OptTensor) -> Tensor:
@@ -377,7 +374,7 @@ class Encoder(nn.Module):
     #         hidden_channels,
     #         hidden_channels,
     #         device=device).to(self.device))
-  
+
   def reset_parameters(self):
     self.lin0 = self.lin0.to(self.device)
     self.lin0.reset_parameters()
@@ -595,9 +592,8 @@ class Decoder(nn.Module):
     # x = latent
     for l in range(self.n_pools):
       # deg = get_deg(x, edge_index, self.device)
+      breakpoint()
       x = self.interpolate(x, pos_list[l], pos_list[l + 1], self.device)
-      if x.isnan().sum():
-        breakpoint()
       edge_index = edge_index_list[l + 1]
       pos = pos_list[l + 1]
       # WITH INITIAL AGG
@@ -656,9 +652,9 @@ class DBA(nn.Module):
         n_pools + 1,
         k_hops,
         device=device).to(self.device)
-    
+
     self.reset_parameters()
-    
+
   def reset_parameters(self):
     self.encoder2D = self.encoder2D.to(self.encoder2D.device)
     self.encoder2D.reset_parameters()

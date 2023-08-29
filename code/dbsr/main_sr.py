@@ -41,7 +41,7 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.data import Data
 from torch_geometric.nn import knn_interpolate
 
-from models_sr import DBGSR
+from models_sr import DBGSR, ModSIRENSR
 from graphdata import PairData, PairDataset
 
 if debug:
@@ -87,7 +87,8 @@ init_data_3 = Data(init_pair.x_3, init_pair.edge_index_3, pos=init_pair.pos_3)
 if debug:
   print('Init')
 
-model = DBGSR(3, init_data_2, args.channels, device).to(device)
+# model = DBGSR(3, init_data_2, args.channels, device).to(device)
+model = ModSIRENSR(init_data_3, args.channels, 3, device).to(device)
 opt = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 sch = torch.optim.lr_scheduler.LinearLR(opt, 1, 1e-2, 1000)
 loss_fn = torch.nn.MSELoss()
@@ -105,16 +106,27 @@ eps = 1e-15
 
 def onera_transform(pos):
   # adjust x to move leading edge to x=0
-  pos[:, 0] = pos[:, 0] - math.tan(math.pi / 6)*pos[:, 1]
+  new_x = pos[:, 0] - math.tan(math.pi / 6)*pos[:, 1]
+  pos = torch.cat((torch.unsqueeze(new_x, 1), pos[:, 1:]), 1)
   # scale chord to equal root
   # c(y) = r(1 - (1-taper)*(y/s))
   # r = c(y) / (1- (1-taper)*(y/s))
-  pos = pos / (1 - 0.44*(pos[:, 1:2] / 1.1963))
+  pos = pos*(1 + (1/0.56 - 1)*(pos[:, 1:2] / 1.1963))
   return pos
 
 
-def interpolate(f, pos_x, pos_y):
-  return knn_interpolate(f, onera_transform(pos_x), onera_transform(pos_y))
+def onera_interp(f, pos_x, pos_y, device: str = "cpu"):
+  # in_idx = (pos_x[:, 1] < 1.1963, pos_y[:, 1] < 1.1963)
+  # out_idx = (pos_x[:, 1] > 1.1963, pos_y[:, 1] > 1.1963)
+  # inboard = knn_interpolate(f[in_idx[0]], onera_transform(pos_x[in_idx[0]]),
+  #                           onera_transform(pos_y[in_idx[1]]))
+
+  # outboard = knn_interpolate(f, pos_x, pos_y)[out_idx[1]]
+  out = torch.where((pos_y[:, 1] < 1.1963).reshape(pos_y.shape),
+                    knn_interpolate(f, onera_transform(pos_x),
+                                    onera_transform(pos_y)),
+                    knn_interpolate(f, pos_x, pos_y))
+  return out
 
 
 def train_step():
@@ -144,11 +156,10 @@ def test_step():
     test_err = 0
     for pair_batch in test_loader:
       pair_batch = pair_batch.to(device)
-      # x_in = interpolate(
-      #     pair_batch.x_2, pair_batch.pos_2, pair_batch.pos_3)
       # out = model(x_in, pair_batch.edge_index_3, pair_batch.pos_3)
-      out = model(pair_batch.x_2, pair_batch.edge_index_2,
-                  pair_batch.edge_index_3, pair_batch.pos_2, pair_batch.pos_3)
+      x_in = onera_interp(
+          pair_batch.x_2, pair_batch.pos_2, pair_batch.pos_3)
+      out = model(x_in, pair_batch.pos_3)
 
       batch_loss = loss_fn(out, pair_batch.x_3)
       test_err = test_err + batch_loss/test_batches

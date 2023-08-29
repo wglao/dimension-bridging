@@ -786,16 +786,27 @@ class DBGSR(nn.Module):
 
   def onera_transform(self, pos):
     # adjust x to move leading edge to x=0
-    pos[:, 0] = pos[:, 0] - math.tan(math.pi / 6)*pos[:, 1]
+    new_x = pos[:, 0] - math.tan(math.pi / 6)*pos[:, 1]
+    pos = torch.cat((torch.unsqueeze(new_x, 1), pos[:, 1:]), 1)
     # scale chord to equal root
     # c(y) = r(1 - (1-taper)*(y/s))
     # r = c(y) / (1- (1-taper)*(y/s))
     pos = pos*(1 + (1/0.56 - 1)*(pos[:, 1:2] / 1.1963))
     return pos
 
-  def onera_interp(self, f, pos_x, pos_y):
-    return knn_interpolate(
-        f, self.onera_transform(pos_x), self.onera_transform(pos_y), k=1)
+
+  def onera_interp(self, f, pos_x, pos_y, device: str = "cpu"):
+    # in_idx = (pos_x[:, 1] < 1.1963, pos_y[:, 1] < 1.1963)
+    # out_idx = (pos_x[:, 1] > 1.1963, pos_y[:, 1] > 1.1963)
+    # inboard = knn_interpolate(f[in_idx[0]], onera_transform(pos_x[in_idx[0]]),
+    #                           onera_transform(pos_y[in_idx[1]]))
+
+    # outboard = knn_interpolate(f, pos_x, pos_y)[out_idx[1]]
+    out = torch.where((pos_y[:, 1] < 1.1963).reshape(pos_y.shape),
+                      knn_interpolate(f, self.onera_transform(pos_x),
+                                      self.onera_transform(pos_y)),
+                      knn_interpolate(f, pos_x, pos_y))
+    return out
 
   def forward(self, x, edge_index_2, edge_index_3, pos_2, pos_3):
     # scale data
@@ -822,3 +833,67 @@ class DBGSR(nn.Module):
     # out = self.conv5(x, edge_index_3, pos_3)
     out = self.lin1(x)
     return out
+
+class ModulateMLP(nn.Module):
+  def __init__(self, in_sz, hidden_sz, layers, device: str = "cpu"):
+    super().__init__()
+    self.in_sz = in_sz
+    self.hidden_sz = hidden_sz
+    self.layers = layers
+    self.device = device
+    
+    self.lin0 = Linear(in_sz, hidden_sz).to(device)
+    self.lin_list = nn.ModuleList()
+    for l in range(layers):
+      self.lin_list.append(Linear(hidden_sz, hidden_sz).to(device))
+
+    self.reset_parameters()
+
+  def reset_parameters(self):
+    self.lin0.reset_parameters()
+    for lin in self.lin_list:
+      lin.reset_parameters()
+
+  def forward(self, x):
+    x = F.selu(self.lin0(x), inplace=True)
+    z = x
+    mod_codes = []
+    for lin in self.lin_list:
+      x = F.selu(lin(x)) + z
+      mod_codes.append(x)
+    return mod_codes
+
+class ModSIRENSR(nn.Module):
+  def __init__(self, init_data, hidden_sz, layers, device: str = "cpu"):
+    super().__init__()
+    self.dim = init_data.pos.size(1)
+    self.in_sz = init_data.x.size(1)
+    self.hidden_sz = hidden_sz
+    self.out_sz = init_data.x.size(1)
+    self.layers = layers
+    self.device = device
+
+    self.mod = ModulateMLP(self.in_sz, hidden_sz, layers, device).to(device)
+    self.lin0 = Linear(self.in_sz, hidden_sz).to(device)
+    self.lin_list = nn.ModuleList()
+    for l in range(layers):
+      self.lin_list.append(Linear(hidden_sz, hidden_sz).to(device))
+    self.lin_final = Linear(hidden_sz,self.out_sz).to(device)
+
+    self.reset_parameters()
+
+  def reset_parameters(self):
+    self.mod.reset_parameters()
+    self.lin0.reset_parameters()
+    for lin in self.lin_list:
+      lin.reset_parameters()
+    self. lin_final.reset_parameters()
+
+  def forward(self, x, pos):
+    mod_codes = self.mod(x)
+    out = torch.sin(self.lin0(pos))
+    for l in range(self.layers):
+      out = mod_codes[l] * torch.sin(self.lin_list[l](out))
+    out = self.lin_final(out)
+    return out
+    
