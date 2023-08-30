@@ -9,3 +9,4 @@ data
 *.sif
 __pycache__
 wandb
+.vscode
