@@ -9,7 +9,7 @@ import torch
 from torch_geometric import compile
 from torch_geometric.loader import DataLoader
 
-from models_gat_sagp import DBA, Encoder, StructureEncoder, Decoder
+from models_dbae import DBA, Encoder, StructureEncoder, Decoder
 from graphdata import PairData, PairDataset
 
 import argparse
@@ -43,4 +43,12 @@ elif args.dataset == 2:
                               "idev-train", n_slices)
 elif args.dataset == 3:
   process_dataset = PairDataset(data_path, [0.5, 0.6], [5e6, 6e6], [5, 6], "idev-test",
+                              n_slices)
+
+elif args.dataset == 4:
+  process_dataset = PairDataset(data_path, [0.3], [3e6], [3], "recon3",
+                              n_slices)
+
+elif args.dataset == 5:
+  process_dataset = PairDataset(data_path, [0.8], [8e6], [8], "recon8",
                               n_slices)

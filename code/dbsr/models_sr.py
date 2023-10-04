@@ -33,7 +33,13 @@ from torch_geometric.utils import (
     spmm,
     to_edge_index,
 )
-from torch_geometric.nn.inits import zeros
+from torch_geometric.nn.inits import zeros, ones, constant, uniform
+from torch_geometric.nn.pool import (
+    global_mean_pool,
+    max_pool,
+    avg_pool_neighbor_x,
+    max_pool_neighbor_x,
+)
 from torch.nn import Parameter
 from torch.nn import ReLU, Sequential
 import torch.nn.functional as F
@@ -158,57 +164,54 @@ class KernelMLP(nn.Module):
     def __init__(
         self,
         dim: int,
-        in_channels: int,
-        hidden_channels: int,
-        out_channels: int,
+        in_size: int,
+        hidden_size: int,
+        out_size: int,
+        omega: float = 100.0,
         device: str = "cpu",
     ) -> None:
         super(KernelMLP, self).__init__()
         self.dim = dim
-        self.in_channels = in_channels
-        self.hidden_channels = hidden_channels
-        self.out_channels = out_channels
+        self.in_size = in_size
+        self.hidden_size = hidden_size
+        self.out_size = out_size
+        self.omega = omega
         self.device = device
 
         # in size is [n, dim + 1] for channel number
-        self.lin0 = Linear(dim + 1, hidden_channels, weight_initializer="glorot").to(
-            device
-        )
+        # self.lin0 = Linear(dim + 1, hidden_size, weight_initializer="glorot").to(device)
+        self.sin0 = SineLayer(dim + 1, hidden_size, omega=omega).to(device)
         # self.lin1 = Linear(
-        #     hidden_channels, hidden_channels,
+        #     hidden_size, hidden_size,
         #     weight_initializer='glorot').to(device)
-        self.lin2 = Linear(
-            hidden_channels, in_channels, weight_initializer="glorot"
-        ).to(device)
+        self.sin1 = SineLayer(hidden_size, hidden_size, omega=omega).to(device)
+        self.sin2 = SineLayer(hidden_size, hidden_size, omega=omega).to(device)
+        self.lin = Linear(hidden_size, in_size).to(device)
 
         self.reset_parameters()
 
     def reset_parameters(self):
-        self.lin0 = self.lin0.to(self.device)
-        self.lin0.reset_parameters()
-        # self.lin1.reset_parameters()
-        self.lin2 = self.lin2.to(self.device)
-        self.lin2.reset_parameters()
+        self.sin0.reset_parameters()
+        self.sin1.reset_parameters()
+        self.lin.reset_parameters()
 
-    def forward(self, rel_pos, channel: int = 0):
+    def forward(self, rel_pos, channel: int = 1):
         # # Convert to spherical [rho, theta, phi] = [r, az, elev]
-        breakpoint()
         rho = torch.norm(rel_pos, dim=1)
         theta = torch.atan2(rel_pos[:, 1], rel_pos[:, 0])
         phi = torch.asin(rel_pos[:, 2] / rho)
-        theta = torch.where(phi.isnan(), torch.zeros_like(theta), theta)
-        phi = torch.where(phi.isnan(), torch.zeros_like(phi), phi)
-
+        theta = torch.where(phi.isnan(), torch.zeros_like(theta).to(self.device), theta)
+        phi = torch.where(phi.isnan(), torch.zeros_like(phi).to(self.device), phi)
         rel_pos = torch.stack((rho, theta / torch.pi, phi / torch.pi), dim=1)
-        out = F.selu(
-            self.lin0(
-                torch.cat((rel_pos, torch.full_like(rho, channel).unsqueeze(1)), 1)
-            ),
-            inplace=True,
+
+        out = self.sin0(
+            torch.concatenate(
+                (rel_pos, torch.full((rel_pos.size(0), 1), channel).to(self.device)), 1
+            )
         )
-        # out = F.selu(self.lin1(out), inplace=True)
-        out = self.lin2(out)
-        # out = out.reshape((self.out_channels, out.size(0), self.in_channels))
+        out = self.sin1(out)
+        out = self.sin2(out)
+        out = self.lin(out)
         return out
 
 
@@ -220,6 +223,7 @@ class GraphKernelConv(MessagePassing):
         hidden_channels: int,
         out_channels: int,
         k_net: nn.Module = KernelMLP,
+        omega: float = 100.0,
         device: str = "cpu",
         **kwargs,
     ):
@@ -230,23 +234,21 @@ class GraphKernelConv(MessagePassing):
         self.hidden_channels = hidden_channels
         self.out_channels = out_channels
         self.device = device
-        # self.k_net = k_net(dim, in_channels, hidden_channels, out_channels,
-        #                    device).to(device)
-        self.k_net = k_net(dim, in_channels, hidden_channels, out_channels, "cpu")
+        self.k_net = k_net(
+            dim, in_channels, hidden_channels, out_channels, omega, device
+        ).to(device)
         # self.lin0 = Linear(in_channels, out_channels).to(device)
         # self.lin1 = Linear(hidden_channels, out_channels).to(device)
 
-        self.bias = Parameter(torch.Tensor(1, out_channels)).to(device)
+        self.bias = Parameter(torch.zeros(1, out_channels).to(device))
 
         self.reset_parameters()
 
     def reset_parameters(self):
         super().reset_parameters()
-        self.k_net = self.k_net.to(self.k_net.device)
         self.k_net.reset_parameters()
         # self.lin0.reset_parameters()
         # self.lin1.reset_parameters()
-        self.bias = self.bias.to(self.device)
         zeros(self.bias)
         # self._cached_edge_index = None
 
@@ -255,15 +257,15 @@ class GraphKernelConv(MessagePassing):
         edge_index, _ = add_remaining_self_loops(edge_index)
         rel_pos = get_edge_attr(edge_index, pos)
 
-        out = self.propagate(edge_index, x=x, edge_weight=rel_pos, size=None)
+        x = self.propagate(edge_index, x=x, edge_weight=rel_pos, size=None)
         # out = self.lin1(out)
-        out = out.squeeze() + self.bias
+        out = x + self.bias
 
         return out
 
     def message_calc(self, x_j: Tensor, rel_pos: Tensor, channel: int = 0):
-        msg = self.k_net(rel_pos.cpu(), channel) * x_j.cpu()
-        return msg.sum(1).to(self.device)
+        msg = self.k_net(rel_pos, channel) * x_j
+        return msg.sum(1)
 
     def message(self, x_j: Tensor, edge_weight: OptTensor) -> Tensor:
         if edge_weight is None:
@@ -467,17 +469,6 @@ class MGN(nn.Module):
         # return out, size_tensor
 
         return out
-
-
-# class Remesher(nn.Module):
-
-#   def __init__(self, dim: int, in_channels, hidden_channels, out_channels,
-#                *args, **kwargs) -> None:
-#     super(Remesher, self).__init__(*args, **kwargs)
-#     self.dim = dim
-#     self.in_channels = in_channels
-#     self.hidden_channels = hidden_channels
-#     self.out_channels = out_channels
 
 
 class DBMGN(nn.Module):
@@ -703,112 +694,117 @@ class NeighborhoodPool(nn.Module):
         return x_pool, edge_pool, pos_pool
 
 
-class StructureEncoder(nn.Module):
+class Encoder(nn.Module):
     def __init__(
         self,
         dim: int,
         init_data: Data,
-        hidden_channels: int,
-        latent_channels: int,
-        k_size: int,
-        n_pools: int,
-        pool_ratio: float,
+        hidden_channels: int = 64,
+        layers: int = 3,
+        latent_sz: int = 32,
+        omega: float = 100,
         device: str = "cpu",
     ):
-        super(StructureEncoder, self).__init__()
+        super(Encoder, self).__init__()
         self.dim = dim
-        self.in_channels = 1
+        self.in_channels = init_data.num_node_features
         self.hidden_channels = hidden_channels
-        self.latent_channels = latent_channels
-        self.k_size = k_size
-        self.n_pools = n_pools
-        self.pool_ratio = pool_ratio
+        self.layers = layers
+        self.latent_sz = latent_sz
         self.device = device
+        self.omega = omega
 
         # initial aggr
+        self.lin0 = Linear(self.in_channels, hidden_channels).to(self.device)
+
         self.conv_list = nn.ModuleList(
             [
-                GATv2Conv(self.in_channels + dim, hidden_channels, edge_dim=dim).to(
-                    self.device
-                )
+                GraphKernelConv(
+                    dim,
+                    hidden_channels + dim,
+                    hidden_channels,
+                    hidden_channels,
+                    omega=omega,
+                    device=device,
+                ).to(self.device)
             ]
         )
-        self.conv_list.append(
-            GATv2Conv(hidden_channels + dim, hidden_channels, edge_dim=dim).to(
-                self.device
-            )
-        )
-        aggs = ["mean", "min", "max", "std"]
-        scls = ["identity", "amplification", "attenuation"]
-        deg = get_deg(init_data.x, init_data.edge_index)
-        # pools
         self.pool_list = nn.ModuleList()
-        for _ in range(n_pools):
-            # # SAGPOOL
-            self.pool_list.append(
-                SAGPoolWithPos(
+        for _ in range(self.layers):
+            self.conv_list.append(
+                GraphKernelConv(
+                    dim,
                     hidden_channels + dim,
-                    pool_ratio,
-                    in_channels=hidden_channels,
-                    out_channels=hidden_channels,
-                    edge_dim=dim,
-                    aggregators=aggs,
-                    scalers=scls,
-                    deg=deg,
+                    hidden_channels,
+                    hidden_channels,
+                    omega=omega,
+                    device=device,
                 ).to(self.device)
             )
 
-            # # MY NEIGHBORHOOD POOL
-            # self.pool_list.append(
-            #     NeighborhoodPool(
-            #         hidden_channels + dim, 1 // pool_ratio, device=device).to(device))
-
-            self.conv_list.append(
-                GATv2Conv(hidden_channels + self.dim, hidden_channels, edge_dim=dim).to(
-                    self.device
-                )
-            )
-
-        # latent dense map
-        # out_sz = get_pooled_sz(init_data.num_nodes, pool_ratio, n_pools)
+        # latent
+        self.lin1 = Linear(hidden_channels, latent_sz).to(self.device)
+        # out_sz = get_pooled_sz(init_data.num_nodes, k_hops, n_pools)
         # self.conv_list.append(
-        #     GATv2Conv(hidden_channels,latent_channels).to(self.device))
+        #     GraphKernelConv(
+        #         dim,
+        #         hidden_channels + dim,
+        #         hidden_channels,
+        #         hidden_channels,
+        #         device=device).to(self.device))
 
-    def forward(self, x, edge_index, pos):
-        x = get_deg(x, edge_index, self.device)
-        edge_attr = get_edge_attr(edge_index, pos)
-        x = F.selu(
-            self.conv_list[0](torch.cat((x, pos), dim=1), edge_index, edge_attr),
-            inplace=True,
+    def reset_parameters(self):
+        self.lin0.reset_parameters()
+        self.lin1.reset_parameters()
+
+        reset_list = [mod.to(mod.device) for mod in self.conv_list]
+        self.conv_list = nn.ModuleList(reset_list)
+        for conv in self.conv_list:
+            conv.reset_parameters()
+
+    def max_pool(self, x, edge_index, keep_idx):
+        data = Data(x, edge_index)
+        data = max_pool_neighbor_x(data)
+        out = data.x[keep_idx]
+        return out
+
+    def forward(
+        self,
+        x,
+        edge_index,
+        pos,
+        pool_edge_index=None,
+        pool_pos=None,
+        pool_keep_idx=None,
+    ):
+        # scale to [-1,1]
+        x = (x - x.min(dim=0).values) / (x.max(dim=0).values - x.min(dim=0).values)
+        pos_max = pos.max(dim=0).values
+        pos_min = pos.min(dim=0).values
+        pos = (pos - pos.min(dim=0).values) / (
+            pos.max(dim=0).values - pos.min(dim=0).values
         )
-        x = F.selu(
-            self.conv_list[1](torch.cat((x, pos), dim=1), edge_index, edge_attr),
-            inplace=True,
+        x = torch.sin(self.omega * self.lin0(x))
+        x = torch.sin(
+            self.omega
+            * (self.conv_list[0](torch.cat((x, pos), dim=1), edge_index, pos))
         )
 
-        pool_edge_list = [edge_index]
-        pool_pos_list = [pos]
-        edge_attr_list = [edge_attr]
-        for l, pool in enumerate(self.pool_list):
-            # # SAGPOOL
-            # x, edge_index, pos, _, _, _, _ = pool(x, edge_index, pos)
+        for l in range(self.layers):
+            keep_idx = pool_keep_idx[l]
+            x = self.max_pool(x, edge_index, keep_idx)
+            edge_index = pool_edge_index[l + 1]
+            pos = pool_pos[l + 1]
+            pos = (pos - pos_min) / (pos_max - pos_min)
 
-            # # MY NEIGHBORHOOD POOL
-            x, edge_index, pos = pool(x, edge_index, pos)
-
-            edge_attr = get_edge_attr(edge_index, pos)
-
-            pool_edge_list.insert(0, edge_index)
-            pool_pos_list.insert(0, pos)
-            edge_attr_list.insert(0, edge_attr)
-
-            x = F.selu(
-                self.conv_list[l + 2](
-                    torch.cat((x, pos), dim=1), edge_index, edge_attr
-                ),
-                inplace=True,
+            x = torch.sin(
+                self.omega
+                * (self.conv_list[l + 1](torch.cat((x, pos), dim=1), edge_index, pos))
             )
-        return pool_edge_list, pool_pos_list, edge_attr_list
+
+        z = self.lin1(x)
+        z = z.mean(0)
+        return z
 
 
 class DBGSR(nn.Module):
@@ -932,96 +928,187 @@ class DBGSR(nn.Module):
         return out
 
 
+class SineLayer(nn.Module):
+    def __init__(self, in_features, out_features, bias=True, omega=30):
+        super().__init__()
+        self.omega = omega
+
+        self.in_features = in_features
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        self.omega = omega
+
+        self.init_weights()
+
+    def init_weights(self):
+        with torch.no_grad():
+            self.linear.weight.uniform_(-1 / self.in_features, 1 / self.in_features)
+
+    def reset_parameters(self):
+        self.init_weights()
+
+    def forward(self, input):
+        return torch.sin(self.omega * self.linear(input))
+
+
 class ModulateMLP(nn.Module):
-    def __init__(self, in_sz, hidden_sz, layers, device: str = "cpu"):
+    def __init__(self, in_sz, hidden_sz, layers, out_size, omega, device: str = "cpu"):
         super().__init__()
         self.in_sz = in_sz
         self.hidden_sz = hidden_sz
         self.layers = layers
+        self.out_size = out_size
+        self.omega = omega
         self.device = device
 
-        self.lin0 = Linear(in_sz, hidden_sz).to(device)
-        self.lin_list = nn.ModuleList()
+        self.sin0 = SineLayer(in_sz, hidden_sz).to(device)
+        self.sin_list = nn.ModuleList()
         for l in range(layers):
-            self.lin_list.append(Linear(hidden_sz, hidden_sz).to(device))
+            self.sin_list.append(SineLayer(hidden_sz, hidden_sz).to(device))
+        self.lin = Linear(hidden_sz, out_size)
 
         self.reset_parameters()
 
     def reset_parameters(self):
-        self.lin0.reset_parameters()
-        for lin in self.lin_list:
-            lin.reset_parameters()
+        self.lin.reset_parameters()
+        for sin in self.sin_list:
+            sin.reset_parameters()
 
-    def forward(self, x):
-        x = F.selu(self.lin0(x), inplace=True)
-        z = x
-        mod_codes = []
-        for lin in self.lin_list:
-            x = F.selu(lin(x)) + z
-            mod_codes.append(x)
-        return mod_codes
+    def forward(self, z):
+        z = self.sin0(z)
+        for s in self.sin_list:
+            z = s(z)
+        out = self.lin(z)
+        return out
+
+
+class MAReSIREN(nn.Module):
+    def __init__(
+        self,
+        in_sz,
+        hidden_sz,
+        out_sz,
+        layers,
+        omega: float = 30.0,
+        device: str = "cpu",
+    ):
+        super(MAReSIREN, self).__init__()
+        self.in_sz = in_sz
+        self.hidden_sz = hidden_sz
+        self.out_sz = out_sz
+        self.layers = layers
+        self.omega = omega
+        self.device = device
+
+        self.sin0 = SineLayer(self.in_sz, hidden_sz, omega=omega).to(device)
+        self.sin_list = nn.ModuleList()
+        for l in range(layers):
+            self.sin_list.append(
+                SineLayer(hidden_sz, hidden_sz, omega=omega).to(device)
+            )
+        self.sin_fin = SineLayer(hidden_sz, self.out_sz, omega=omega).to(device)
+
+        self.mare_min = torch.tensor([0.2, 2e6, -9]).to(self.device)
+        self.mare_max = torch.tensor([0.8, 1e7, 9]).to(self.device)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.sin0.reset_parameters()
+        for sin in self.sin_list:
+            sin.reset_parameters()
+        self.sin_fin.reset_parameters()
+
+    def forward(self, mare):
+        # scale inputs to [-1, 1]
+        # (ma,re,a) \in ([0.2,0.8],[2e6,1e7],[-9,9])
+        mare = (mare - self.mare_min) / (self.mare_max - self.mare_min)
+
+        out = self.sin0(mare)
+        for l in range(self.layers):
+            out = self.sin_list[l](out)
+        out = self.sin_fin(out)
+        return out
 
 
 class ModSIREN(nn.Module):
-    def __init__(self, init_data, hidden_sz, out_sz, layers, device: str = "cpu"):
+    def __init__(
+        self,
+        dim,
+        in_sz,
+        hidden_sz,
+        out_sz,
+        layers,
+        omega: float = 30.0,
+        device: str = "cpu",
+    ):
         super().__init__()
-        self.dim = init_data.pos.size(1)
-        self.in_sz = init_data.x.size(1)
+        self.dim = dim
+        self.in_sz = in_sz
         self.hidden_sz = hidden_sz
         # self.out_sz = init_data.x.size(1)
         self.out_sz = out_sz
         self.layers = layers
+        self.omega = omega
         self.device = device
 
-        self.mod = ModulateMLP(self.in_sz, hidden_sz, layers, device).to(device)
-        self.lin0 = Linear(self.dim, hidden_sz).to(device)
-        self.lin_list = nn.ModuleList()
+        self.mod = ModulateMLP(self.in_sz, hidden_sz, layers, layers, device).to(device)
+        self.sin0 = SineLayer(self.dim, hidden_sz, omega=omega).to(device)
+        self.sin_list = nn.ModuleList()
         for l in range(layers):
-            self.lin_list.append(Linear(hidden_sz, hidden_sz).to(device))
-        self.lin_final = Linear(hidden_sz, self.out_sz).to(device)
-
-        self.omega = 30
-        self.omega = Parameter()
+            self.sin_list.append(
+                SineLayer(hidden_sz, hidden_sz, omega=omega).to(device)
+            )
+        self.lin = Linear(hidden_sz, self.out_sz).to(device)
 
         self.reset_parameters()
 
     def reset_parameters(self):
         self.mod.reset_parameters()
-        self.lin0.reset_parameters()
-        for lin in self.lin_list:
-            lin.reset_parameters()
-        self.lin_final.reset_parameters()
+        self.sin0.reset_parameters()
+        for sin in self.sin_list:
+            sin.reset_parameters()
+        self.lin.reset_parameters()
 
-    def forward(self, x, pos):
+    def forward(self, z, pos):
         # scale inputs to [-1, 1]
-        # x = (x - x.min(dim=0).values) / (x.max(dim=0).values - x.min(dim=0).values)
-        # pos = (pos - pos.min(dim=0).values) / (
-        #     pos.max(dim=0).values - pos.min(dim=0).values)
-
-        mod_codes = self.mod(x)
-        out = torch.sin(self.omega * self.lin0(pos))
+        # z = (z - z.min(dim=0).values) / (z.max(dim=0).values - z.min(dim=0).values)
+        pos = (pos - pos.min(dim=0).values) / (
+            pos.max(dim=0).values - pos.min(dim=0).values
+        )
+        alphas = self.mod(z)
+        out = self.sin0(pos)
         for l in range(self.layers):
-            out = mod_codes[l] * torch.sin(self.omega * self.lin_list[l](out))
-        out = self.lin_final(out)
+            out = self.sin_list[l](alphas[:, l : l + 1] * out)
+        out = self.lin(out)
         return out
 
 
 class ModSIRENSR(nn.Module):
-    def __init__(self, init_data, hidden_sz, layers, device: str = "cpu"):
+    def __init__(self, init_data, hidden_sz, layers, omega, device: str = "cpu"):
         super().__init__()
         self.dim = init_data.pos.size(1)
         self.in_sz = init_data.x.size(1)
         self.hidden_sz = hidden_sz
         self.out_sz = init_data.x.size(1)
         self.layers = layers
+        self.omega = omega
         self.device = device
 
         self.mods1 = ModSIREN(
-            self.in_sz, 2 * hidden_sz + 1, hidden_sz, layers, device
+            self.dim, self.in_sz, 2 * hidden_sz + 1, hidden_sz, layers, omega, device
         ).to(device)
         self.mods2 = ModSIREN(
-            hidden_sz, 2 * self.in_sz + 1, self.in_sz, layers, device
+            self.dim,
+            self.hidden_sz,
+            2 * self.in_sz + 1,
+            self.in_sz,
+            layers,
+            omega,
+            device,
         ).to(device)
+        # self.mods2 = ModSIREN(
+        #     self.dim, self.in_sz, self.hidden_sz, self.in_sz, layers, omega, device
+        # ).to(device)
 
         self.reset_parameters()
 
@@ -1030,16 +1117,141 @@ class ModSIRENSR(nn.Module):
         self.mods2.reset_parameters()
 
     def forward(self, x, pos_2, pos_3):
-        # scale inputs to [-1, 1]
-        # x = (x - x.min(dim=0).values) / (x.max(dim=0).values - x.min(dim=0).values)
-        # pos = (pos - pos.min(dim=0).values) / (
-        #     pos.max(dim=0).values - pos.min(dim=0).values)
-
+        # pos_2_scale = (pos_2 - pos_2.min(dim=0).values) / (
+        #     pos_2.max(dim=0).values - pos_2.min(dim=0).values)
+        # pos_3_scale = (pos_3 - pos_3.min(dim=0).values) / (
+        #     pos_3.max(dim=0).values - pos_3.min(dim=0).values)
         x = self.mods1(x, pos_2)
 
         # upsample
         x = onera_interp(x, pos_2, pos_3)
+        # scale inputs to [-1, 1]
+        # x = (x - x.min(dim=0).values) / (x.max(dim=0).values - x.min(dim=0).values)
 
         out = self.mods2(x, pos_3)
 
+        return out
+
+
+class DBModSIREN(nn.Module):
+    def __init__(
+        self,
+        # Encoder
+        init_data,
+        enc_layers: int,
+        latent_size,
+        # ModSIREN
+        hidden_size,
+        out_size,
+        siren_layers: int,
+        omega: float = 1.0,
+        device: str = "cpu",
+    ) -> None:
+        super(DBModSIREN, self).__init__()
+        self.hidden_size = hidden_size
+        self.latent_size = latent_size
+        self.out_size = out_size
+        self.omega = omega
+        self.device = device
+
+        self.dim = init_data.pos.size(1)
+        self.enc_layers = enc_layers
+        self.siren_layers = siren_layers
+
+        # Encoder
+        self.encoder = Encoder(
+            self.dim, init_data, hidden_size, enc_layers, latent_size, omega, device
+        ).to(device)
+
+        # Modulated SIREN
+        self.mods = ModSIREN(
+            self.dim,
+            latent_size,
+            hidden_size,
+            out_size,
+            siren_layers,
+            omega,
+            device,
+        ).to(device)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.encoder.reset_parameters()
+        self.mods.reset_parameters()
+
+    def forward(
+        self,
+        x,
+        edge_index,
+        pos_2,
+        pos_3,
+        pool_edge_index=None,
+        pool_pos=None,
+        pool_keep_idx=None,
+    ):
+        z = self.encoder(x, edge_index, pos_2, pool_edge_index, pool_pos, pool_keep_idx)
+        out = self.mods(z, pos_3)
+        return out
+
+
+class MAReModSIREN(nn.Module):
+    def __init__(
+        self,
+        # Encoder
+        enc_layers: int,
+        latent_size,
+        enc_omega,
+        # ModSIREN
+        init_data,
+        hidden_size,
+        out_size,
+        siren_layers: int,
+        omega: float = 1.0,
+        device: str = "cpu",
+    ) -> None:
+        super(MAReModSIREN, self).__init__()
+        self.hidden_size = hidden_size
+        self.latent_size = latent_size
+        self.out_size = out_size
+        self.enc_omega = enc_omega
+        self.omega = omega
+        self.device = device
+
+        self.dim = init_data.pos.size(1)
+        self.enc_layers = enc_layers
+        self.siren_layers = siren_layers
+
+        # Encoder
+        self.mare_encoder = MAReSIREN(
+            3, hidden_size, latent_size, enc_layers, enc_omega, device
+        ).to(device)
+
+        # 1 Modulated SIREN per output
+        self.mods_list = nn.ModuleList([])
+        for o in range(out_size):
+            self.mods_list.append(
+                ModSIREN(
+                    self.dim,
+                    latent_size,
+                    hidden_size,
+                    1,
+                    siren_layers,
+                    omega,
+                    device,
+                ).to(device)
+            )
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.mare_encoder.reset_parameters()
+        for mod in self.mods_list:
+            mod.reset_parameters()
+
+    def forward(self, mare, pos):
+        z = self.mare_encoder(mare)
+        out = torch.concatenate([mods(z, pos) for mods in self.mods_list], 1).to(
+            self.device
+        )
         return out

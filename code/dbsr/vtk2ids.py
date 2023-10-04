@@ -42,7 +42,7 @@ def combine(idx_list, dat_list, n_list):
   indices = np.concatenate([a + b for a, b in zip(idx_list, buffer)],
                            axis=-1)
   
-  data = np.concatenate(dat_list, axis=None)
+  data = np.concatenate(dat_list, axis=0)
   
   return indices, data, out_sz
 
