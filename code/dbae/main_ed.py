@@ -199,7 +199,7 @@ def train_step():
     model.train()
     loss = 0
     err = 0
-    for pair_batch in train_loader:
+    for pair_batch in iter(train_loader):
         opt.zero_grad()
 
         pair_batch = pair_batch.to(device)
@@ -229,7 +229,7 @@ def test_step():
     model.eval()
     with torch.no_grad():
         test_err = 0
-        for pair_batch in train_loader:
+        for pair_batch in iter(test_loader):
             pair_batch = pair_batch.to(device)
             x_in = 2 * (pair_batch.x_2 - x_min) / (x_max - x_min) - 1
             out = model(

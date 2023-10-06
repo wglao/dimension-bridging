@@ -181,7 +181,7 @@ with torch.no_grad():
     )
 opt = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 sch = torch.optim.lr_scheduler.LinearLR(opt, 1, 1e-2, 1000)
-opt_l = torch.optim.LBFGS(model.parameters(), lr=0.01, line_search_fn="strong_wolfe")
+opt_l = torch.optim.LBFGS(model.parameters(), lr=args.learning_rate, line_search_fn="strong_wolfe")
 sch_l = torch.optim.lr_scheduler.LinearLR(opt_l, 1, 1e-2, 1000)
 # sch = torch.optim.lr_scheduler.ExponentialLR(opt,args.decay)
 # plat = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5)
@@ -199,11 +199,11 @@ def get_edge_attr(edge_index, pos):
 
 def train_step(opt, opt_l, lbfgs:bool = False):
     model.train()
-    loss = 0
-    err = 0
-    for pair_batch in train_loader:
-        pair_batch = pair_batch.to(device)
-        if not lbfgs:
+    if not lbfgs:
+        loss = 0
+        err = 0
+        for pair_batch in train_loader:
+            pair_batch = pair_batch.to(device)
             opt.zero_grad()
 
             x_in = 2 * (pair_batch.x_2 - x_min) / (x_max - x_min) - 1
@@ -219,15 +219,15 @@ def train_step(opt, opt_l, lbfgs:bool = False):
             batch_loss = data_loss  # + lambda_2*score_loss_2 + lambda_3*score_loss_3
             batch_loss.backward()
             opt.step()
-
-            loss += batch_loss
-            err += data_loss
             del pair_batch, out, data_loss, batch_loss
-        else:
-            params = model.state_dict()
-            def closure():
-                if torch.is_grad_enabled():
-                    opt_l.zero_grad()
+        return opt, opt_l
+    else:
+        params = model.state_dict()
+        def closure():
+            loss = 0.
+            opt_l.zero_grad()
+            for pair_batch in train_loader:
+                pair_batch = pair_batch.to(device)
 
                 x_in = 2 * (pair_batch.x_2 - x_min) / (x_max - x_min) - 1
                 out = model(
@@ -238,24 +238,34 @@ def train_step(opt, opt_l, lbfgs:bool = False):
                 )
 
                 # in case of additional loss terms
-                batch_loss = loss_fn(out, pair_batch.x_3)
-                # batch_loss = data_loss  # + lambda_2*score_loss_2 + lambda_3*score_loss_3
-                if batch_loss.requires_grad:
-                    batch_loss.backward()
-                return batch_loss
-            
-            with torch.no_grad():
-                batch_loss = closure()
-                loss += batch_loss
-                err += batch_loss
-            
-            opt_l.step(closure)
-            for param_name, param in model.state_dict().items():
-                if torch.isnan(param).any():
-                    model.load_state_dict(params)
-                    opt_l = torch.optim.LBFGS(model.parameters(), lr=0.01)
-                    return train_step(lbfgs=False)
+                loss += loss_fn(out, pair_batch.x_3)
+                # loss = data_loss  # + lambda_2*score_loss_2 + lambda_3*score_loss_3
+            loss /= batches
+            loss.backward()
+            return loss.item()
+        
+        # with torch.no_grad():
+        #     loss = closure()
+        
+        opt_l.step(closure)
+        for param_name, param in model.state_dict().items():
+            if torch.isnan(param).any():
+                if debug:
+                    print("Diverged. Restoring Previous Step.")
+                model.load_state_dict(params)
+                opt_l = torch.optim.LBFGS(model.parameters(), lr=sch_l._last_lr[0])
+                return train_step(lbfgs=False)
 
+        return opt, opt_l
+
+
+def test_step():
+    model.eval()
+    with torch.no_grad():
+        test_err = 0
+        batch_loss = 0
+        for pair_batch in iter(train_loader):
+            pair_batch = pair_batch.to(device)
             x_in = 2 * (pair_batch.x_2 - x_min) / (x_max - x_min) - 1
             out = model(
                 x_in,
@@ -263,24 +273,10 @@ def train_step(opt, opt_l, lbfgs:bool = False):
                 pair_batch.pos_2,
                 pool_structures,
             )
-
-            # in case of additional loss terms
-            data_loss = loss_fn(out, pair_batch.x_3)
-            batch_loss = data_loss  # + lambda_2*score_loss_2 + lambda_3*score_loss_3
-            batch_loss.backward()
-            opt.step()
-            del pair_batch, batch_loss
-
-    loss /= batches
-    err /= batches
-    return loss, err, opt, opt_l
-
-
-def test_step():
-    model.eval()
-    with torch.no_grad():
-        test_err = 0
-        for pair_batch in train_loader:
+            loss = loss_fn(out, pair_batch.x_3)
+            batch_loss += loss
+        batch_loss /= batches
+        for pair_batch in iter(test_loader):
             pair_batch = pair_batch.to(device)
             x_in = 2 * (pair_batch.x_2 - x_min) / (x_max - x_min) - 1
             out = model(
@@ -292,7 +288,7 @@ def test_step():
             batch_loss = loss_fn(out, pair_batch.x_3)
             test_err += batch_loss
         test_err /= test_batches
-    return test_err
+    return batch_loss, test_err
 
 
 def main(n_epochs, opt, opt_l):
@@ -304,10 +300,9 @@ def main(n_epochs, opt, opt_l):
         print("Train")
     for epoch in range(n_epochs):
         # lr = sch._last_lr[0]
-        loss, train_err, opt, opt_l = train_step(opt, opt_l, lbfgs)
+        opt, opt_l = train_step(opt, opt_l, lbfgs)
+        loss, test_err  = test_step()
         lbfgs = loss < 0.1
-            
-        test_err = test_step()
         sch.step()
         if lbfgs:
             if not first:
@@ -318,7 +313,7 @@ def main(n_epochs, opt, opt_l):
         if debug:
             print(
                 "Loss {:g}, Error {:g} / {:g}, Epoch {:g},".format(
-                    loss, train_err, test_err, epoch
+                    loss, loss, test_err, epoch
                 )
             )
         if epoch % 10 == 0 or epoch == n_epochs - 1:
@@ -326,7 +321,7 @@ def main(n_epochs, opt, opt_l):
                 wandb.log(
                     {
                         "Loss": loss,
-                        "Train Error": train_err,
+                        "Train Error": loss,
                         "Test Error": test_err,
                         "Epoch": epoch,
                     }
