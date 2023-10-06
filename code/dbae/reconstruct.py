@@ -6,10 +6,9 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.data import Data
 from torch_geometric.utils import to_networkx
 import numpy as np
-from models_dbae import DBA
+from models_dbed import DBED
 from graphdata import PairDataset
 
-import metis
 import networkx as nx
 
 import argparse
@@ -17,24 +16,31 @@ import argparse
 parser = argparse.ArgumentParser()
 
 parser.add_argument(
-    "--case-name", default="dba-gcn-sin", type=str, help="Architecture Name"
+    "--case-name", default="dbed-siren", type=str, help="Architecture Name"
 )
-parser.add_argument("--channels", default=5, type=int, help="Aggregation Channels")
+parser.add_argument("--channels", default=32, type=int, help="Aggregation Channels")
 parser.add_argument(
-    "--latent-sz", default=5, type=int, help="Latent Space Dimensionality"
+    "--latent-sz", default=16, type=int, help="Latent Space Dimensionality"
+)
+parser.add_argument(
+    "--siren-layers", default=1, type=int, help="Number of SIREN Layers"
+)
+parser.add_argument(
+    "--omega", default=1.0, type=float, help="Omega0 for SIREN"
 )
 parser.add_argument(
     "--pooling-layers", default=1, type=int, help="Number of Pooling Layers"
 )
-parser.add_argument("--k-hops", default=1, type=int, help="k-hop neighborhood")
-parser.add_argument("--learning-rate", default=5e-3, type=float, help="Learning Rate")
+parser.add_argument("--batch-sz", default=1, type=int, help="Batch Size")
+parser.add_argument("--learning-rate", default=1e-4, type=float, help="Learning Rate")
 parser.add_argument("--coarse", default=1, type=int, help="Coarse (1) or Fine (0)")
+parser.add_argument("--slices", default=5, type=int, help="Number of Input Slices")
 parser.add_argument("--wandb", default=1, type=int, help="wandb upload")
 parser.add_argument("--gpu-id", default=0, type=int, help="GPU index")
-parser.add_argument("--mach", default=0.8, type=float, help="Mach Number")
-parser.add_argument("--reynolds", default=8e6, type=float, help="Reynolds Number")
-parser.add_argument("--aoa", default=8.0, type=float, help="Angle of Attack")
-parser.add_argument("--date", default="200923", type=str, help="Date of run in ddmmyy")
+parser.add_argument("--mach", default=0.3, type=float, help="Mach Number")
+parser.add_argument("--reynolds", default=3e6, type=float, help="Reynolds Number")
+parser.add_argument("--aoa", default=3.0, type=float, help="Angle of Attack")
+parser.add_argument("--date", default="051023", type=str, help="Date of run in ddmmyy")
 parser.add_argument("--epoch", default=7, type=int, help="Checkpoint Epoch")
 
 args = parser.parse_args()
@@ -51,21 +57,64 @@ pool_path = os.path.join(data_root, "processed/pool")
 
 def main(save_path):
     n_slices = 5
+    if args.wandb:
+        train_dataset = PairDataset(
+            data_root,
+            [args.mach],
+            [args.reynolds],
+            [args.aoa],
+            "_".join(("train", coarse_fine, "{:d}s".format(n_slices))),
+            n_slices,
+        )
+    else:
+        train_dataset = PairDataset(
+            data_root,
+            [args.mach],
+            [args.reynolds],
+            [args.aoa],
+            "_".join(("idev-train", coarse_fine, "{:d}s".format(n_slices))),
+            n_slices,
+        )
     recon_dataset = PairDataset(
         data_root,
         [args.mach],
         [args.reynolds],
         [args.aoa],
-        "_".join(("recon8", coarse_fine)),
+        "_".join(("recon3", coarse_fine, "{:d}s".format(n_slices))),
         n_slices,
     )
+    train_loader = DataLoader(train_dataset)
     recon_loader = DataLoader(recon_dataset)
 
-    pair = next(iter(recon_loader))[0].to(device)
+    with torch.no_grad():
+        init_data = next(iter(train_loader))
+        init_data = init_data[0].to(device)
+        # get scaling values
+        x_min = torch.zeros_like(init_data.x_2[0]).to(device)
+        x_max = torch.zeros_like(init_data.x_2[0]).to(device)
 
-    model = DBA(
-        3, pair, args.channels, args.latent_sz, args.pooling_layers, args.k_hops, device
-    ).to(device)
+        for d in iter(train_loader):
+            x = d.x_2.to(device)
+            x_min = torch.where(x.min(dim=0).values < x_min, x.min(dim=0).values, x_min).to(device)
+            x_max = torch.where(x.max(dim=0).values > x_max, x.max(dim=0).values, x_max).to(device)
+
+        # x_init = 2 * (init_data.x_2 - x_min) / (x_max - x_min) - 1
+
+        # # outputs linearly dependent
+        out_szs = [5,]
+        # # outputs linearly independent
+        # out_szs = [1,1,1,1,1]
+
+        model = DBED(
+                    init_data,
+                    args.channels,
+                    args.latent_sz,
+                    out_szs,
+                    args.siren_layers,
+                    args.pooling_layers,
+                    args.omega,
+                    device,
+                ).to(device)
 
     # get save
     run_path = os.path.join(save_path, case_name, args.date)
@@ -81,6 +130,7 @@ def main(save_path):
 
     model.eval()
     with torch.no_grad():
+        pair = next(iter(recon_loader))
         pool_structures = torch.load(
             os.path.join(
                 pool_path,
@@ -90,16 +140,18 @@ def main(save_path):
                 + ".pt",
             )
         )
+        for key in pool_structures.keys():
+            item = pool_structures[key]
+            if type(item) == torch.Tensor:
+                pool_structures[key] = item.to(device)
+            elif type(item) == list:
+                pool_structures[key] = [i.to(device) for i in item]
+        x_in = 2 * (pair.x_2 - x_min) / (x_max - x_min) - 1
         f_recon = model(
-            pair.x_2,
+            x_in,
             pair.edge_index_2,
             pair.pos_2,
-            pair.pos_3,
-            [a.to(device) for a in pool_structures["ei2"]],
-            [a.to(device) for a in pool_structures["ei3"]],
-            [a.to(device) for a in pool_structures["p2"]],
-            [a.to(device) for a in pool_structures["p3"]],
-            [a.to(device) for a in pool_structures["k2"]],
+            pool_structures,
         )
         mse_rho = torch.nn.MSELoss()(f_recon[:, 0], pair.x_3[:, 0])
         mse_u = torch.nn.MSELoss()(f_recon[:, 1:4], pair.x_3[:, 1:4])

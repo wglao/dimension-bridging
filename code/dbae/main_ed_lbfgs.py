@@ -181,6 +181,7 @@ with torch.no_grad():
     )
 opt = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 sch = torch.optim.lr_scheduler.LinearLR(opt, 1, 1e-2, 1000)
+opt_l = torch.optim.LBFGS(model.parameters(), lr=0.01)
 # sch = torch.optim.lr_scheduler.ExponentialLR(opt,args.decay)
 # plat = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5)
 loss_fn = torch.nn.MSELoss()
@@ -195,31 +196,60 @@ def get_edge_attr(edge_index, pos):
     return edge_attr
 
 
-def train_step():
+def train_step(lbfgs:bool = False):
     model.train()
     loss = 0
     err = 0
     for pair_batch in train_loader:
-        opt.zero_grad()
-
         pair_batch = pair_batch.to(device)
-        x_in = 2 * (pair_batch.x_2 - x_min) / (x_max - x_min) - 1
-        out = model(
-            x_in,
-            pair_batch.edge_index_2,
-            pair_batch.pos_2,
-            pool_structures,
-        )
+        if not lbfgs:
+            opt.zero_grad()
 
-        # in case of additional loss terms
-        data_loss = loss_fn(out, pair_batch.x_3)
-        batch_loss = data_loss  # + lambda_2*score_loss_2 + lambda_3*score_loss_3
-        batch_loss.backward()
-        opt.step()
+            x_in = 2 * (pair_batch.x_2 - x_min) / (x_max - x_min) - 1
+            out = model(
+                x_in,
+                pair_batch.edge_index_2,
+                pair_batch.pos_2,
+                pool_structures,
+            )
 
-        loss += batch_loss
-        err += data_loss
-        del pair_batch, out, data_loss, batch_loss
+            # in case of additional loss terms
+            data_loss = loss_fn(out, pair_batch.x_3)
+            batch_loss = data_loss  # + lambda_2*score_loss_2 + lambda_3*score_loss_3
+            batch_loss.backward()
+            opt.step()
+
+            loss += batch_loss
+            err += data_loss
+            del pair_batch, out, data_loss, batch_loss
+        else:
+            def closure():
+                if torch.is_grad_enabled():
+                    opt_l.zero_grad()
+
+                x_in = 2 * (pair_batch.x_2 - x_min) / (x_max - x_min) - 1
+                out = model(
+                    x_in,
+                    pair_batch.edge_index_2,
+                    pair_batch.pos_2,
+                    pool_structures,
+                )
+
+                # in case of additional loss terms
+                batch_loss = loss_fn(out, pair_batch.x_3)
+                # batch_loss = data_loss  # + lambda_2*score_loss_2 + lambda_3*score_loss_3
+                if batch_loss.requires_grad:
+                    batch_loss.backward()
+                return batch_loss
+            
+            with torch.no_grad():
+                batch_loss = closure()
+                loss += batch_loss
+                err += batch_loss
+            
+            opt_l.step(closure)
+            del pair_batch, batch_loss
+
     loss /= batches
     err /= batches
     return loss, err
@@ -247,11 +277,14 @@ def test_step():
 def main(n_epochs):
     min_err = torch.inf
     save = os.path.join(save_path, "model_init")
+    lbfgs = False
     if debug:
         print("Train")
     for epoch in range(n_epochs):
-        lr = sch._last_lr[0]
-        loss, train_err = train_step()
+        # lr = sch._last_lr[0]
+        loss, train_err = train_step(lbfgs)
+        lbfgs = loss < 1
+            
         test_err = test_step()
         sch.step()
 

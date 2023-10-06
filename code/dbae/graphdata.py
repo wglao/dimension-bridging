@@ -54,7 +54,7 @@ class PairDataset(InMemoryDataset):
 
     @property
     def processed_file_names(self):
-        return ["_".join([self.dset_name, "data.pt"])]
+        return ["".join([self.dset_name, ".pt"])]
 
     def process(self):
         data_list = []
@@ -98,7 +98,7 @@ class PairDataset(InMemoryDataset):
                     slice_coords = []
 
                     for s in range(self.n_slices):
-                        idx = int((s*10)//self.n_slices)
+                        idx = int((s*5)//self.n_slices)
                         mesh = pv.read(
                             os.path.join(data_path, "slice_{:d}.vtk".format(idx))
                         )
