@@ -181,7 +181,8 @@ with torch.no_grad():
     )
 opt = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 sch = torch.optim.lr_scheduler.LinearLR(opt, 1, 1e-2, 1000)
-opt_l = torch.optim.LBFGS(model.parameters(), lr=0.01)
+opt_l = torch.optim.LBFGS(model.parameters(), lr=0.01, line_search_fn="strong_wolfe")
+sch_l = torch.optim.lr_scheduler.LinearLR(opt_l, 1, 1e-2, 1000)
 # sch = torch.optim.lr_scheduler.ExponentialLR(opt,args.decay)
 # plat = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5)
 loss_fn = torch.nn.MSELoss()
@@ -196,7 +197,7 @@ def get_edge_attr(edge_index, pos):
     return edge_attr
 
 
-def train_step(lbfgs:bool = False):
+def train_step(opt, opt_l, lbfgs:bool = False):
     model.train()
     loss = 0
     err = 0
@@ -223,6 +224,7 @@ def train_step(lbfgs:bool = False):
             err += data_loss
             del pair_batch, out, data_loss, batch_loss
         else:
+            params = model.state_dict()
             def closure():
                 if torch.is_grad_enabled():
                     opt_l.zero_grad()
@@ -248,11 +250,30 @@ def train_step(lbfgs:bool = False):
                 err += batch_loss
             
             opt_l.step(closure)
+            for param_name, param in model.state_dict().items():
+                if torch.isnan(param).any():
+                    model.load_state_dict(params)
+                    opt_l = torch.optim.LBFGS(model.parameters(), lr=0.01)
+                    return train_step(lbfgs=False)
+
+            x_in = 2 * (pair_batch.x_2 - x_min) / (x_max - x_min) - 1
+            out = model(
+                x_in,
+                pair_batch.edge_index_2,
+                pair_batch.pos_2,
+                pool_structures,
+            )
+
+            # in case of additional loss terms
+            data_loss = loss_fn(out, pair_batch.x_3)
+            batch_loss = data_loss  # + lambda_2*score_loss_2 + lambda_3*score_loss_3
+            batch_loss.backward()
+            opt.step()
             del pair_batch, batch_loss
 
     loss /= batches
     err /= batches
-    return loss, err
+    return loss, err, opt, opt_l
 
 
 def test_step():
@@ -274,19 +295,25 @@ def test_step():
     return test_err
 
 
-def main(n_epochs):
+def main(n_epochs, opt, opt_l):
     min_err = torch.inf
     save = os.path.join(save_path, "model_init")
     lbfgs = False
+    first = True
     if debug:
         print("Train")
     for epoch in range(n_epochs):
         # lr = sch._last_lr[0]
-        loss, train_err = train_step(lbfgs)
-        lbfgs = loss < 1
+        loss, train_err, opt, opt_l = train_step(opt, opt_l, lbfgs)
+        lbfgs = loss < 0.1
             
         test_err = test_step()
         sch.step()
+        if lbfgs:
+            if not first:
+                sch_l.step()
+            else:
+                first = False
 
         if debug:
             print(
@@ -328,4 +355,4 @@ if __name__ == "__main__":
             name=case_name,
             settings=wandb.Settings(_disable_stats=True),
         )
-    main(n_epochs)
+    main(n_epochs, opt, opt_l)
