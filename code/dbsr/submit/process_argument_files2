@@ -1,0 +1,4 @@
+cd /scratch1/07169/wgl/ORNL/dimension-bridging; apptainer exec --nv db.sif /app/jax-env/bin/python code/dbsr/process_dataset.py --dataset 4 --slices 1
+cd /scratch1/07169/wgl/ORNL/dimension-bridging; apptainer exec --nv db.sif /app/jax-env/bin/python code/dbsr/process_dataset.py --dataset 5 --slices 1
+cd /scratch1/07169/wgl/ORNL/dimension-bridging; apptainer exec --nv db.sif /app/jax-env/bin/python code/dbsr/process_dataset.py --dataset 6 --slices 1
+cd /scratch1/07169/wgl/ORNL/dimension-bridging; apptainer exec --nv db.sif /app/jax-env/bin/python code/dbsr/process_dataset.py --dataset 7 --slices 1
