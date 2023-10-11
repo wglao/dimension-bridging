@@ -8,7 +8,9 @@ from functools import partial
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--part", default=0, type=int, help="Partition (1) or Pool Only (0)")
+parser.add_argument(
+    "--part", default=0, type=int, help="Partition (1) or Pool Only (0)"
+)
 parser.add_argument(
     "--pooling-layers", default=1, type=int, help="Number of Pooling Layers"
 )
@@ -16,6 +18,7 @@ parser.add_argument(
     "--k-hops", default=3, type=int, help="Pooling Neighborhood Span Distance"
 )
 parser.add_argument("--coarse", default=1, type=int, help="Coarse or Fine")
+parser.add_argument("--slices", default=1, type=int, help="Number of Input Slices")
 parser.add_argument("--wandb", default=0, type=int, help="wandb upload")
 parser.add_argument("--debug", default=0, type=bool, help="debug prints")
 parser.add_argument("--gpu-id", default=0, type=int, help="GPU index")
@@ -54,23 +57,27 @@ re_list = [2e6, 3e6, 5e6, 6e6, 8e6, 9e6]
 # aoa_list = [-12, -11, -10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
 aoa_list = [-9, -8, -7, -6, -5, -4, -3, 3, 4, 5, 6, 7, 8, 9]
 
-n_slices = 5
+n_slices = args.slices
 data_path = os.path.join(os.environ["SCRATCH"], "ORNL/dimension-bridging/data")
 
 if args.coarse:
-    coarse_fine = "_coarse"
+    coarse_fine = "coarse"
 else:
-    coarse_fine = "_fine"
+    coarse_fine = "fine"
 
 test_dataset = PairDataset(
-    data_path, [0.3], [3e6], [3], "recon3" + coarse_fine, n_slices
+    data_path,
+    [0.3],
+    [3e6],
+    [3],
+    "_".join(("recon3", coarse_fine, "{:d}s".format(n_slices))),
 )
 
 test_sz = 1
 test_loader = DataLoader(test_dataset, test_sz, follow_batch=["x_3", "x_2"])
 
 init_data = next(iter(test_loader))
-init_data = init_data[0].to(device)
+init_data = init_data.to(device)
 
 k_hops = args.k_hops
 
@@ -229,67 +236,37 @@ with torch.no_grad():
         edge_index_list = [get_edge_list(adj) for adj in sp_list]
         return edge_index_list, pos_list, keep_list
 
-    def partition(
-        x, edge_index, pos, ghost: bool = True, maxit: int = 10, tol: float = 0.01
-    ):
-        it = 0
-        err = 1
-        y_cut = 2
-        while it < maxit and err > tol:
-            parts = torch.zeros((x.size(0)))
-            parts = torch.where(pos[:, 1] > y_cut, parts + 2, parts)
-            parts = torch.where((pos[:, 2]) > 0, parts + 1, parts)
+    def partition(y_cut: torch.Tensor, x, edge_index, pos, ghost: bool = False):
+        parts = torch.zeros((x.size(0))).to(device)
+        parts = torch.where(pos[:, 1] >= y_cut[0], parts + 1, parts)
+        if y_cut.size(0) == 2:
+            parts = torch.where((pos[:, 1]) < y_cut[1], parts, torch.zeros_like(parts))
 
-            part_graphs = []
-            if not ghost:
-                part_idx = parts[edge_index]
-                for i in range(4):
-                    x_i = x[parts == i]
-                    edge_index_i = edge_index[
-                        :, (part_idx[0] == i) & (part_idx[1] == i)
-                    ]
-                    # renumber edges
-                    old_idx = edge_index_i.unique()
-                    re_idx = torch.zeros((old_idx.max()))
-                    re_idx[old_idx] = torch.arange(old_idx.size(0))
-                    edge_index_i = re_idx[edge_index_i]
-                    pos_i = pos[parts == i]
-                    part_graphs.append(
-                        Data(x_i, edge_index_i, pos=pos_i, old_idx=old_idx)
-                    )
-            else:
-                edge_index = get_edge_aug(edge_index, args.k_hops)
-                part_idx = parts[edge_index]
-                for i in range(4):
-                    x_i = x[parts == i]
-                    edge_index_i = edge_index[
-                        :, (part_idx[0] == i) & (part_idx[1] == i)
-                    ]
-                    # renumber edges
-                    old_idx = edge_index_i.unique()
-                    re_idx = torch.zeros((old_idx.max()+1)).int()
-                    re_idx[old_idx] = torch.arange(old_idx.size(0)).int()
-                    edge_index_i = re_idx[edge_index_i]
-                    pos_i = pos[parts == i]
-                    part_graphs.append(
-                        Data(x_i, edge_index_i, pos=pos_i, old_idx=old_idx)
-                    )
-            it += 1
-            edge_counts = torch.tensor([pg.edge_index.size(1) for pg in part_graphs])
-            wing_denser = (
-                True
-                if (torch.argmax(edge_counts) == 0) or (torch.argmax(edge_counts) == 1)
-                else False
-            )
-            if wing_denser:
-                y_cut -= 1 / (it + 1)
-            else:
-                y_cut += 1 / (it + 1)
+        if not ghost:
+            part_idx = parts[edge_index]
+            edge_index_i = edge_index[:, (part_idx[0] == 1) & (part_idx[1] == 1)]
+            # renumber edges
+            old_idx = edge_index_i.unique()
+            re_idx = torch.zeros((old_idx.max() + 1)).int().to(device)
+            re_idx[old_idx] = torch.arange(old_idx.size(0)).int().to(device)
+            edge_index_i = re_idx[edge_index_i]
+            x_i = x[old_idx]
+            pos_i = pos[old_idx]
+            part_graph = Data(x_i, edge_index_i, pos=pos_i, old_idx=old_idx).to(device)
+        else:
+            edge_index = get_edge_aug(edge_index, args.k_hops)
+            part_idx = parts[edge_index]
+            x_i = x[parts == 1]
+            edge_index_i = edge_index[:, (part_idx[0] == 1) & (part_idx[1] == 1)]
+            # renumber edges
+            old_idx = edge_index_i.unique()
+            re_idx = torch.zeros((old_idx.max() + 1)).int()
+            re_idx[old_idx] = torch.arange(old_idx.size(0)).int()
+            edge_index_i = re_idx[edge_index_i]
+            pos_i = pos[parts == 1]
+            part_graph = Data(x_i, edge_index_i, pos=pos_i, old_idx=old_idx)
+        return part_graph
 
-            err = torch.abs(edge_counts.max() - edge_counts.min()).float() / edge_counts.float().mean()
-        return part_graphs
-
-    
     def pool(data):
         # move to cpu for memory
         data = data.cpu().detach()
@@ -317,37 +294,83 @@ with torch.no_grad():
             pool_structures,
             os.path.join(
                 pool_path,
-                "pool_{:d}layers".format(args.pooling_layers) + coarse_fine + ".pt",
+                "_".join(("pool_{:d}layers".format(args.pooling_layers), coarse_fine, "{:d}s.pt".format(n_slices)))
             ),
         )
         return pool_structures
 
+    def pool3d(data):
+        # move to cpu for memory
+        data = data.cpu().detach()
+
+        if debug:
+            print("Pooling 3D")
+        edge_index_list, pos_list, keep_list = decimation_pool(
+            data.x, data.edge_index, data.pos
+        )
+
+        pool_structures = {
+            "ei": edge_index_list,
+            "p": pos_list,
+            "k": keep_list,
+        }
+
+        return pool_structures
 
     def pnp(data, pool_stuctures=None):
-      # move to cpu for memory
-      data = data.cpu().detach()
-    
-      if pool_structures is None:
-        pool_structures = pool(data)
+        # move to cpu for memory
+        data = data.cpu().detach()
 
-      partitions = []
-      for edge, pos in zip(pool_structures["ei3"], pool_structures["p3"]):
-          partitions.append(partition(data.x_3, edge, pos))
+        if pool_structures is None:
+            pool_structures = pool(data)
 
+        partitions = []
+        for edge, pos in zip(pool_structures["ei3"], pool_structures["p3"]):
+            partitions.append(partition(data.x_3, edge, pos))
 
-      torch.save(
-          pool_structures,
-          os.path.join(
-              pool_path,
-              "pnp_{:d}layers".format(args.pooling_layers) + coarse_fine + ".pt",
-          ),
-      )
+        torch.save(
+            pool_structures,
+            os.path.join(
+                pool_path,
+                "pnp_{:d}layers".format(args.pooling_layers) + coarse_fine + ".pt",
+            ),
+        )
 
-      return pool_structures
-        
+        return pool_structures
+
 
 if __name__ == "__main__":
-    if part:
-        pnp(init_data)
-    else:
-        pool(init_data)
+    # pool(init_data)
+    # get partitions
+    ys = init_data.pos_2[:, 1].unique().to(device)
+    y_cuts = torch.cat((torch.tensor([0]).to(device), torch.diff(ys) / 2 + ys[:-1]))
+    parts = []
+    part_fn = partial(
+        partition,
+        x=init_data.x_3,
+        edge_index=init_data.edge_index_3,
+        pos=init_data.pos_3,
+    )
+    for i in range(ys.size(0)):
+        if i == ys.size(0) - 1:
+            parts.append(part_fn(torch.tensor([y_cuts[-1]]).to(device)))
+        else:
+            parts.append(part_fn(torch.tensor([y_cuts[i], y_cuts[i + 1]]).to(device)))
+    torch.save(
+        parts,
+        os.path.join(
+            pool_path,
+            "_".join(("parts_{:d}layers".format(args.pooling_layers), coarse_fine, "{:d}s.pt".format(n_slices)))
+        ),
+    )
+
+    # PNP
+    pnp_structures = [pool3d(part) for part in parts]
+
+    torch.save(
+        pnp_structures,
+        os.path.join(
+            pool_path,
+            "_".join(("pnp_{:d}layers".format(args.pooling_layers), coarse_fine, "{:d}s.pt".format(n_slices)))
+        ),
+    )

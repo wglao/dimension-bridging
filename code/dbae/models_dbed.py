@@ -96,12 +96,11 @@ def onera_transform(pos):
     return pos
 
 
-def onera_interp(f, pos_x, pos_y):
-    
+def onera_interp(f, pos_x, pos_y, k: int = 1):
     out = torch.where(
         (pos_y[:, 1] < 1.1963).unsqueeze(1).tile((1, f.size(1))),
-        knn_interpolate(f, onera_transform(pos_x), onera_transform(pos_y)),
-        knn_interpolate(f, pos_x, pos_y),
+        knn_interpolate(f, onera_transform(pos_x), onera_transform(pos_y), k=k),
+        knn_interpolate(f, pos_x, pos_y, k=k),
     )
     return out
 
@@ -137,31 +136,34 @@ class ModulateMLP(nn.Module):
         self.omega = omega
         self.device = device
 
-        self.sin0 = SineLayer(in_sz, hidden_sz, omega=omega).to(device)
-        self.sin_list = nn.ModuleList()
+        # self.sin0 = SineLayer(in_sz, hidden_sz, omega=omega).to(device)
+        # self.sin_list = nn.ModuleList()
         self.lin_list = nn.ModuleList()
         for l in range(layers):
-            self.sin_list.append(SineLayer(hidden_sz, hidden_sz, omega=omega).to(device))
-            self.lin_list.append(Linear(hidden_sz, 1).to(device))
+            # self.sin_list.append(SineLayer(hidden_sz, hidden_sz, omega=omega).to(device))
+            self.lin_list.append(Linear(hidden_sz, hidden_sz).to(device))
 
         self.reset_parameters()
 
     def reset_parameters(self):
-        self.sin0.reset_parameters()
-        for s,l in zip(self.sin_list, self.lin_list):
-            s.reset_parameters()
+        # self.sin0.reset_parameters()
+        # for s in self.sin_list:
+        #     s.reset_parameters()
+        for l in self.lin_list:
             l.reset_parameters()
 
     def forward(self, z):
-        
-        z = self.sin0(z)
+        # z = self.sin0(z)
         out = []
 
-        for s,l in zip(self.sin_list,self.lin_list):
-            z = s(z)
-            out.append(l(z))
+        # for s in self.sin_list:
+        #     z = s(z)
+        #     out.append(z)
+        for l in self.lin_list:
+            z = F.selu(l(z))
+            out.append(z)
         if len(out) > 1:
-            return torch.stack(out,1).to(self.device)
+            return torch.stack(out, 1).to(self.device)
         return out[0]
 
 
@@ -185,11 +187,11 @@ class KernelMLP(nn.Module):
         self.omega = omega
         self.device = device
 
-        self.sin0 = SineLayer(dim+1,hidden_sz,omega=omega)
+        self.sin0 = SineLayer(dim + 1, hidden_sz, omega=omega)
         self.sin_list = nn.ModuleList([])
         for l in range(layers):
-            self.sin_list.append(SineLayer(hidden_sz,hidden_sz,omega=omega))
-        self.lin = Linear(hidden_sz,out_sz)
+            self.sin_list.append(SineLayer(hidden_sz, hidden_sz, omega=omega))
+        self.lin = Linear(hidden_sz, out_sz)
 
         self.reset_parameters()
 
@@ -209,10 +211,17 @@ class KernelMLP(nn.Module):
 
         # # scale [rho, theta, phi] to [-1,1]^3
         # graphs are static, so can scale here instead of outside the loop
-        rho = 2*(rho - rho.min(dim=0).values)/(rho.max(dim=0).values - rho.min(dim=0).values) - 1
+        rho = (
+            2
+            * (rho - rho.min(dim=0).values)
+            / (rho.max(dim=0).values - rho.min(dim=0).values)
+            - 1
+        )
         theta = theta / torch.pi
-        phi = 2*phi/torch.pi
-        rel_pos = torch.stack((rho, theta, phi, torch.full_like(rho, 2*channel/self.in_sz - 1)), dim=1)
+        phi = 2 * phi / torch.pi
+        rel_pos = torch.stack(
+            (rho, theta, phi, torch.full_like(rho, 2 * channel / self.in_sz - 1)), dim=1
+        )
         out = self.sin0(rel_pos)
         for s in self.sin_list:
             out = s(out)
@@ -241,9 +250,15 @@ class GraphKernelConv(MessagePassing):
         self.out_channels = out_channels
         self.device = device
         self.omega = omega
-        self.k_net = k_net(dim, in_channels, hidden_channels, k_net_layers, out_channels, omega=omega, device=device).to(
-            device
-        )
+        self.k_net = k_net(
+            dim,
+            in_channels,
+            hidden_channels,
+            k_net_layers,
+            out_channels,
+            omega=omega,
+            device=device,
+        ).to(device)
 
         self.bias = Parameter(torch.Tensor(1, out_channels)).to(device)
 
@@ -260,7 +275,7 @@ class GraphKernelConv(MessagePassing):
         edge_index, _ = add_remaining_self_loops(edge_index)
         rel_pos = get_edge_attr(edge_index, pos)
         out = self.propagate(edge_index, x=x, edge_weight=rel_pos, size=None)
-        if len(out.shape)>2:
+        if len(out.shape) > 2:
             out = out.squeeze(2)
         out += self.bias
         return out
@@ -273,7 +288,7 @@ class GraphKernelConv(MessagePassing):
         if edge_weight is None:
             msg = x_j
         else:
-            if self.out_channels>1:
+            if self.out_channels > 1:
                 msg = []
                 for i in range(self.out_channels):
                     msg.append(self.message_calc(x_j, edge_weight, i))
@@ -389,8 +404,9 @@ class Encoder(nn.Module):
     def __init__(
         self,
         dim: int,
-        in_channels: Data,
+        in_channels: int,
         hidden_channels: int,
+        knet_width: int,
         latent_channels: int,
         n_pools: int,
         omega: float,
@@ -401,6 +417,7 @@ class Encoder(nn.Module):
         self.dim = dim
         self.in_channels = in_channels
         self.hidden_channels = hidden_channels
+        self.knet_width = knet_width
         self.latent_channels = latent_channels
         self.n_pools = n_pools
         self.omega = omega
@@ -408,29 +425,42 @@ class Encoder(nn.Module):
         self.device = device
 
         # initial aggr
-        self.sin0 = SineLayer(self.in_channels, hidden_channels, omega=omega).to(self.device)
+        self.sin0 = SineLayer(self.in_channels, hidden_channels, omega=omega).to(
+            self.device
+        )
 
         self.conv0 = GraphKernelConv(
-                    dim,
-                    hidden_channels,
-                    hidden_channels,
-                    hidden_channels,
-                    # k_net = KernelMLP,
-                    # k_net_layers = k_net_layers,
-                    omega=omega,
-                    device=device,
-                ).to(self.device)
+            dim,
+            hidden_channels,
+            knet_width,
+            hidden_channels,
+            # k_net = KernelMLP,
+            # k_net_layers = k_net_layers,
+            omega=omega,
+            device=device,
+        ).to(self.device)
 
         self.conv_list = nn.ModuleList([])
         # pools
         self.pool_list = nn.ModuleList()
+        # self.conv_list.append(
+        #         GraphKernelConv(
+        #             dim,
+        #             hidden_channels,
+        #             hidden_channels,
+        #             hidden_channels,
+        #             # k_net = KernelMLP,
+        #             # k_net_layers = k_net_layers,
+        #             omega=omega,
+        #             device=device,
+        #         ).to(self.device)
+        #     )
         for _ in range(n_pools):
-
             self.conv_list.append(
                 GraphKernelConv(
                     dim,
                     hidden_channels,
-                    hidden_channels,
+                    knet_width,
                     hidden_channels,
                     # k_net = KernelMLP,
                     # k_net_layers = k_net_layers,
@@ -438,15 +468,17 @@ class Encoder(nn.Module):
                     device=device,
                 ).to(self.device)
             )
-        
+
         # latent
-        self.sin1 = SineLayer(hidden_channels,latent_channels,omega=omega)
+        # self.sin1 = SineLayer(hidden_channels, latent_channels, omega=omega)
+        self.lin1 = Linear(hidden_channels, latent_channels)
 
         self.reset_parameters()
 
     def reset_parameters(self):
         self.sin0.reset_parameters()
-        self.sin1.reset_parameters()
+        # self.sin1.reset_parameters()
+        self.lin1.reset_parameters()
 
         for conv in self.conv_list:
             conv.reset_parameters()
@@ -467,23 +499,21 @@ class Encoder(nn.Module):
         pool_keep_idx,
     ):
         x = self.sin0(x)
-        x = torch.sin(self.omega*(
-                self.conv0(x, edge_index, pos))
-            )
+        x = torch.sin(self.omega * (self.conv0(x, edge_index, pos)))
 
         # for l, pool in enumerate(self.pool_list):
-        for l in range(self.n_pools):
+        # for l in range(self.n_pools):
+        for l, conv in enumerate(self.conv_list):
             keep_idx = pool_keep_idx[l]
             x = self.max_pool(x, edge_index, keep_idx)
             edge_index = pool_edge_index[l + 1]
             pos = pool_pos[l + 1]
+            x = torch.sin(self.omega * (conv(x, edge_index, pos)))
 
-            x = torch.sin(self.omega*
-                (self.conv_list[l](x, edge_index, pos))
-            )
-
-        x = self.sin1(x)
+        x = self.lin1(x)
+        x = x.max(dim=0).values
         return x
+
 
 class ModSIREN(nn.Module):
     def __init__(
@@ -491,7 +521,7 @@ class ModSIREN(nn.Module):
         dim,
         in_sz,
         hidden_sz,
-        out_szs: list,
+        out_sz: int,
         layers,
         omega: float = 30.0,
         device: str = "cpu",
@@ -501,7 +531,7 @@ class ModSIREN(nn.Module):
         self.in_sz = in_sz
         self.hidden_sz = hidden_sz
         # self.out_sz = init_data.x.size(1)
-        self.out_szs = out_szs
+        self.out_szs = out_sz
         self.layers = layers
         self.omega = omega
         self.device = device
@@ -509,13 +539,11 @@ class ModSIREN(nn.Module):
         self.mod = ModulateMLP(self.in_sz, hidden_sz, layers, omega, device).to(device)
         self.sin0 = SineLayer(self.dim, hidden_sz, omega=omega).to(device)
         self.sin_list = nn.ModuleList([])
-        self.out_lins = nn.ModuleList([])
-        for o in out_szs:
-            for l in range(layers):
-                self.sin_list.append(
-                    SineLayer(hidden_sz, hidden_sz, omega=omega).to(device)
-                )
-            self.out_lins.append(Linear(hidden_sz, o).to(device))
+        for l in range(layers):
+            self.sin_list.append(
+                SineLayer(hidden_sz, hidden_sz, omega=omega).to(device)
+            )
+        self.out_lin = Linear(hidden_sz, out_sz).to(device)
 
         self.reset_parameters()
 
@@ -524,40 +552,33 @@ class ModSIREN(nn.Module):
         self.sin0.reset_parameters()
         for sin in self.sin_list:
             sin.reset_parameters()
-        for lin in self.out_lins:
-            lin.reset_parameters()
+        self.out_lin.reset_parameters()
 
     def forward(self, z, pos):
-        pos = 2*(pos - pos.min(dim=0).values) / (
-            pos.max(dim=0).values - pos.min(dim=0).values
-        ) - 1
         alphas = self.mod(z)
-        x = self.sin0(pos)
-        out = []
-        for o in range(len(self.out_szs)):
-            y = x
-            for l in range(self.layers):
-                y = alphas[:, l : l + 1] * self.sin_list[self.layers*o+l](y)
-            out.append(self.out_lins[o](y))
-        if len(out)>1:
-            return torch.cat(out,dim=1).to(self.device)
-        return out[0]
-    
+        out = self.sin0(pos)
+        for l, s in enumerate(self.sin_list):
+            out = alphas[:, l] * s(out)
+        out = self.out_lin(out)
+        return out
+
+
 class DBED(nn.Module):
     def __init__(
         self,
-        init_data: PairData,
+        channels,
         hidden_sz,
         latent_sz,
         out_szs,
         layers,
         n_pools,
-        omega:float = 30.,
-        device:str = "cpu"
+        omega: float = 30.0,
+        device: str = "cpu",
     ):
         super().__init__()
-        self.dim = init_data.pos_3.size(1)
-        self.in_sz = init_data.x_2.size(1)
+        self.dim = 3
+        self.in_sz = 5
+        self.channels = channels
         self.hidden_sz = hidden_sz
         self.latent_sz = latent_sz
         self.out_szs = out_szs
@@ -566,27 +587,139 @@ class DBED(nn.Module):
         self.omega = omega
         self.device = device
 
-        self.enc = Encoder(self.dim,self.in_sz,hidden_sz,latent_sz,n_pools,omega,device)
-        self.dec = ModSIREN(self.dim,latent_sz,hidden_sz,out_szs,layers,omega,device)
+        # self.enc = Encoder(self.dim,self.in_sz,hidden_sz,latent_sz,n_pools,omega,device)
+        self.enc = Encoder(
+            self.dim, self.in_sz, channels, channels * 2, latent_sz, 1, omega, device
+        )
+        self.dec = ModSIREN(
+            self.dim, latent_sz, hidden_sz, out_szs, layers, omega, device
+        )
 
         self.reset_parameters()
-    
+
     def reset_parameters(self):
         self.enc.reset_parameters()
         self.dec.reset_parameters()
 
-    def forward(self,x,edge_index,pos,pool_structures):
-        z = self.enc(
-                x,
-                edge_index,
-                pos,
-                pool_structures["ei2"],
-                pool_structures["p2"],
-                pool_structures["k2"])
-        pos_2 = pool_structures["p2"][-1]
+    def forward(self, x, edge_index, pos, pool_structures):
         pos_3 = pool_structures["p3"][0]
 
-        z = onera_interp(z,pos_2,pos_3)
+        # process 2D slice first
+        z = self.enc(
+            x,
+            edge_index,
+            pos,
+            pool_structures["ei2"],
+            pool_structures["p2"],
+            pool_structures["k2"],
+        )
 
-        x = self.dec(z, pos_3)
+        # z = onera_interp(z, pool_structures["p2"][-1], pos_3)
+        z = z*torch.ones((pos_3.size(0),self.latent_sz)).to(self.device)
+
+        # for part in parts:
+        #     z[part.old_idx] = knn_interpolate(z,pos,part.pos,k=1)
+
+        # upsample before processing
+        # x_in = torch.zeros((pos_3.size(0),x.size(1)))
+        # z = torch.zeros((pos_3.size(0),self.latent_sz)).to(self.device)
+        # for part, pool in zip(parts, pnp):
+        #     x_in = onera_interp(x,pos,part.pos,3)
+        #     z[part.old_idx] = self.enc(
+        #         x_in,
+        #         part.edge_index,
+        #         part.pos,
+        #         pool["ei"],
+        #         pool["p"],
+        #         pool["k"]
+        #     )
+        pos_in = (
+            2
+            * (pos_3 - pos_3.min(dim=0).values)
+            / (pos_3.max(dim=0).values - pos_3.min(dim=0).values)
+            - 1
+        )
+        x = self.dec(z, pos_in)
+        return x
+
+
+class DBEDParts(nn.Module):
+    def __init__(
+        self,
+        channels,
+        hidden_sz,
+        latent_sz,
+        out_szs,
+        layers,
+        n_pools,
+        omega: float = 30.0,
+        device: str = "cpu",
+    ):
+        super().__init__()
+        self.dim = 3
+        self.in_sz = 5
+        self.channels = channels
+        self.hidden_sz = hidden_sz
+        self.latent_sz = latent_sz
+        self.out_szs = out_szs
+        self.layers = layers
+        self.n_pools = n_pools
+        self.omega = omega
+        self.device = device
+
+        # self.enc = Encoder(self.dim,self.in_sz,hidden_sz,latent_sz,n_pools,omega,device)
+        self.enc = Encoder(
+            self.dim, self.in_sz, channels, channels * 2, latent_sz, 1, omega, device
+        )
+        self.dec = ModSIREN(
+            self.dim, latent_sz, hidden_sz, out_szs, layers, omega, device
+        )
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        self.enc.reset_parameters()
+        self.dec.reset_parameters()
+
+    def forward(self, x, edge_index, pos, pool_structures, parts, pnp):
+        pos_3 = pool_structures["p3"][0]
+
+        # process 2D slice first
+        z = self.enc(
+            x,
+            edge_index,
+            pos,
+            pool_structures["ei2"],
+            pool_structures["p2"],
+            pool_structures["k2"],
+        )
+
+        # z = onera_interp(z,pool_structures["p2"][-1],pos_3)
+
+        x = torch.zeros((pool_structures["p3"][0].size(0), 5)).to(self.device)
+        for part in parts:
+            z_p = knn_interpolate(z, pool_structures["p2"][-1], part.pos, k=1)
+            pos_in = (
+                2
+                * (part.pos - part.pos.min(dim=0).values)
+                / (part.pos.max(dim=0).values - part.pos.min(dim=0).values)
+                - 1
+            )
+            x[part.old_idx] = self.dec(z_p, pos_in)
+
+        # upsample before processing
+        # x_in = torch.zeros((pos_3.size(0),x.size(1)))
+        # z = torch.zeros((pos_3.size(0),self.latent_sz)).to(self.device)
+        # for part, pool in zip(parts, pnp):
+        #     x_in = onera_interp(x,pos,part.pos,3)
+        #     z[part.old_idx] = self.enc(
+        #         x_in,
+        #         part.edge_index,
+        #         part.pos,
+        #         pool["ei"],
+        #         pool["p"],
+        #         pool["k"]
+        #     )
+
+        # x = self.dec(z, pos_3)
         return x

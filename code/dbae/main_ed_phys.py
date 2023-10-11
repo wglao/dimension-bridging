@@ -10,11 +10,12 @@ import argparse
 parser = argparse.ArgumentParser()
 
 parser.add_argument(
-    "--case-name", default="dbed-siren-lbfgs", type=str, help="Architecture Name"
+    "--case-name", default="dbed-siren", type=str, help="Architecture Name"
 )
-parser.add_argument("--channels", default=64, type=int, help="Aggregation Channels")
+parser.add_argument("--enc-channels", default=32, type=int, help="Aggregation Channels")
+parser.add_argument("--siren-width", default=256, type=int, help="SIREN Layer Width")
 parser.add_argument(
-    "--latent-sz", default=16, type=int, help="Latent Space Dimensionality"
+    "--latent-sz", default=32, type=int, help="Latent Space Dimensionality"
 )
 parser.add_argument(
     "--siren-layers", default=1, type=int, help="Number of SIREN Layers"
@@ -49,11 +50,11 @@ from torch_geometric.data import Data
 from torch_geometric.utils import to_networkx
 from torch_geometric.nn.pool import avg_pool_neighbor_x
 import torch.nn.functional as F
-import torch.nn.utils as ut
 
-from models_dbed import DBED
+from models_dbed import DBED, DBEDParts
 from graphdata import PairData, PairDataset
-# from pool_and_part import pnp
+import pyvista as pv
+# from pool_and_part import partition
 
 if debug:
     # torch.autograd.detect_anomaly(True)
@@ -73,25 +74,57 @@ if args.coarse:
     coarse_fine = "coarse"
 else:
     coarse_fine = "fine"
-data_path = os.path.join(
-    os.environ["SCRATCH"], "ORNL/dimension-bridging/data"
-)
+data_path = os.path.join(os.environ["SCRATCH"], "ORNL/dimension-bridging/data")
 if wandb_upload:
     train_dataset = PairDataset(
-        data_path, ma_list, re_list, aoa_list, "train_" + coarse_fine + "_{:d}s".format(n_slices), n_slices
+        data_path,
+        ma_list,
+        re_list,
+        aoa_list,
+        "train_" + coarse_fine + "_{:d}s".format(n_slices),
+        n_slices,
     )
     test_dataset = PairDataset(
-        data_path, ma_list, [4e6, 7e6, 1e7], aoa_list, "test_" + coarse_fine + "_{:d}s".format(n_slices), n_slices
+        data_path,
+        ma_list,
+        [4e6, 7e6, 1e7],
+        aoa_list,
+        "test_" + coarse_fine + "_{:d}s".format(n_slices),
+        n_slices,
     )
 else:
+    # train_dataset = PairDataset(
+    #     data_path,
+    #     [0.3, 0.4],
+    #     [3e6, 4e6],
+    #     [3, 4],
+    #     "idev-train_" + coarse_fine + "_{:d}s".format(n_slices),
+    #     n_slices,
+    # )
+    # test_dataset = PairDataset(
+    #     data_path,
+    #     [0.5, 0.6],
+    #     [5e6, 6e6],
+    #     [5, 6],
+    #     "idev-test_" + coarse_fine + "_{:d}s".format(n_slices),
+    #     n_slices,
+    # )
     train_dataset = PairDataset(
-        data_path, [0.3, 0.4], [3e6, 4e6], [3, 4], "idev-train_" + coarse_fine + "_{:d}s".format(n_slices), n_slices
+        data_path,
+        [0.3],
+        [3e6],
+        [3],
+        "recon3_" + coarse_fine + "_{:d}s".format(n_slices),
+        n_slices,
     )
     test_dataset = PairDataset(
-        data_path, [0.5, 0.6], [5e6, 6e6], [5, 6], "idev-test_" + coarse_fine + "_{:d}s".format(n_slices), n_slices
+        data_path,
+        [0.3],
+        [3e6],
+        [3],
+        "recon3_" + coarse_fine + "_{:d}s".format(n_slices),
+        n_slices,
     )
-    # train_dataset = PairDataset(data_path, [0.3], [3e6], [3], "recon3_" + coarse_fine + "_{:d}s".format(n_slices), n_slices)
-    # test_dataset = PairDataset(data_path, [0.3], [3e6], [3], "recon3_" + coarse_fine + "_{:d}s".format(n_slices), n_slices)
 
 
 n_samples = len(train_dataset)
@@ -144,46 +177,91 @@ else:
             pool_structures[key] = [i.to(device) for i in item]
 
 if debug:
+    print("Loading 3D partitions")
+parts = torch.load(
+    os.path.join(
+        pool_path,
+        "parts_{:d}layers_".format(args.pooling_layers) + coarse_fine + ".pt",
+    )
+)
+parts = [part.to(device) for part in parts]
+
+pnp = torch.load(
+    os.path.join(
+        pool_path,
+        "pnp_{:d}layers_".format(args.pooling_layers) + coarse_fine + ".pt",
+    )
+)
+for p in range(len(pnp)):
+    for key in pnp[p].keys():
+            item = pnp[p][key]
+            if type(item) == torch.Tensor:
+                pnp[p][key] = item.to(device)
+            elif type(item) == list:
+                pnp[p][key] = [i.to(device) for i in item]
+
+if debug:
     print("Init")
 
-n_epochs = 10000
+n_epochs = 100000
 eps = 1e-15
 
 with torch.no_grad():
     init_data = init_data.to(device)
     # get scaling values
-    x_min = torch.zeros_like(init_data.x_2[0]).to(device)
-    x_max = torch.zeros_like(init_data.x_2[0]).to(device)
+    x_init = init_data.x_2.reshape((init_data.pos_2.size(0), 5))
+    x_min = torch.zeros_like(x_init[0]).to(
+        device
+    )
+    x_max = torch.zeros_like(x_init[0]).to(
+        device
+    )
 
     for d in iter(train_loader):
-        x = d.x_2.to(device)
-        x_min = torch.where(x.min(dim=0).values < x_min, x.min(dim=0).values, x_min).to(device)
-        x_max = torch.where(x.max(dim=0).values > x_max, x.max(dim=0).values, x_max).to(device)
+        x = d.x_2.to(device).reshape((d.pos_2.size(0), 5))
+        x_min = torch.where(x.min(dim=0).values < x_min, x.min(dim=0).values, x_min).to(
+            device
+        )
+        x_max = torch.where(x.max(dim=0).values > x_max, x.max(dim=0).values, x_max).to(
+            device
+        )
 
-    x_init = 2 * (init_data.x_2 - x_min) / (x_max - x_min) - 1
+    x_init = 2 * (x_init - x_min) / (x_max - x_min) - 1
 
     # # outputs linearly dependent
-    out_szs = [5,]
+    out_szs = [
+        5,
+    ]
     # # outputs linearly independent
     # out_szs = [1,1,1,1,1]
+    # model = torch.jit.trace(
+    #     DBED(
+    #         init_data,
+    #         args.channels,
+    #         args.latent_sz,
+    #         out_szs,
+    #         args.siren_layers,
+    #         args.pooling_layers,
+    #         args.omega,
+    #         device,
+    #     ).to(device),
+    #     (x_init, init_data.edge_index_2, init_data.pos_2, pool_structures, parts, pnp),
+    # )
+    model = DBEDParts(
+        args.enc_channels,
+        args.siren_width,
+        args.latent_sz,
+        out_szs,
+        args.siren_layers,
+        args.pooling_layers,
+        args.omega,
+        device,
+    ).to(device)
 
-    model = torch.jit.trace(
-        DBED(
-            init_data,
-            args.channels,
-            args.latent_sz,
-            out_szs,
-            args.siren_layers,
-            args.pooling_layers,
-            args.omega,
-            device,
-        ).to(device),
-        (x_init, init_data.edge_index_2, init_data.pos_2, pool_structures),
-    )
+    mesh = pv.read(os.path.join(data_path, coarse_fine, "ma_0.3/re_3e+06/a_3/flow.vtu"))
+
 opt = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-sch = torch.optim.lr_scheduler.LinearLR(opt, 1, 1.25e-2, 1000)
-opt_l = torch.optim.LBFGS(model.parameters(), lr=args.learning_rate, line_search_fn="strong_wolfe")
-sch_l = torch.optim.lr_scheduler.LinearLR(opt_l, 1, 1e-2, 500)
+sch = torch.optim.lr_scheduler.LinearLR(opt, 1, 1e-2, 100)
 # sch = torch.optim.lr_scheduler.ExponentialLR(opt,args.decay)
 # plat = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5)
 loss_fn = torch.nn.MSELoss()
@@ -198,124 +276,95 @@ def get_edge_attr(edge_index, pos):
     return edge_attr
 
 
-def train_step(opt, opt_l, lbfgs:bool = False):
+def phys_loss(x, mesh):
+    # # convective flux
+    # gam = 1.4
+    # u = x[:,1:4]/x[:,0]
+    # p = (gam-1)*x[:,0]*(x[:,-1]-0.5*(u.transpose(0,1)@u))
+    # fc = torch.cat((x[:,1:4],x[:,1:4]@u.transpose(0,1) + torch.diag_embed(torch.ones((x.size(0)))*p),))
+
+    # cons of mass
+    dru = torch.gradient()
+    pass
+
+
+def train_step():
     model.train()
-    if not lbfgs:
-        loss = 0
-        err = 0
-        for pair_batch in train_loader:
-            pair_batch = pair_batch.to(device)
-            opt.zero_grad()
+    loss = 0
+    err = 0
+    for pair_batch in iter(train_loader):
+        opt.zero_grad()
 
-            x_in = 2 * (pair_batch.x_2 - x_min) / (x_max - x_min) - 1
-            out = model(
-                x_in,
-                pair_batch.edge_index_2,
-                pair_batch.pos_2,
-                pool_structures,
-            )
+        pair_batch = pair_batch.to(device)
+        x_in = pair_batch.x_2
+        if len(x_in.shape) == 1:
+            x_in = x_in.reshape((pair_batch.pos_2.size(0), 5))
+        x_in = 2 * (x_in - x_min) / (x_max - x_min) - 1
 
-            # in case of additional loss terms
-            data_loss = loss_fn(out, pair_batch.x_3)
-            batch_loss = data_loss  # + lambda_2*score_loss_2 + lambda_3*score_loss_3
-            batch_loss.backward()
-            ut.clip_grad_norm_(model.parameters(), batch_loss)
-            opt.step()
-            del pair_batch, out, data_loss, batch_loss
-        return opt, opt_l
-    else:
-        params = model.state_dict()
-        def closure():
-            loss = 0.
-            opt_l.zero_grad()
-            for pair_batch in train_loader:
-                pair_batch = pair_batch.to(device)
+        out = model(
+            x_in,
+            pair_batch.edge_index_2,
+            pair_batch.pos_2,
+            pool_structures,
+            parts,
+            pnp,
+        )
 
-                x_in = 2 * (pair_batch.x_2 - x_min) / (x_max - x_min) - 1
-                out = model(
-                    x_in,
-                    pair_batch.edge_index_2,
-                    pair_batch.pos_2,
-                    pool_structures,
-                )
+        # in case of additional loss terms
+        data_loss = loss_fn(out, pair_batch.x_3)
+        batch_loss = data_loss  # + lambda_2*score_loss_2 + lambda_3*score_loss_3
+        batch_loss.backward()
+        opt.step()
 
-                # in case of additional loss terms
-                loss += loss_fn(out, pair_batch.x_3)
-                # loss = data_loss  # + lambda_2*score_loss_2 + lambda_3*score_loss_3
-            loss /= batches
-            loss.backward()
-            ut.clip_grad_norm_(model.parameters(), loss)
-            return loss.item()
-        
-        # with torch.no_grad():
-        #     loss = closure()
-        opt_l.step(closure)
-        for param_name, param in model.state_dict().items():
-            if torch.isnan(param).any():
-                if debug:
-                    print("Diverged. Restoring Previous Step.")
-                model.load_state_dict(params)
-                opt_l = torch.optim.LBFGS(model.parameters(), lr=sch_l._last_lr[0])
-                return train_step(lbfgs=False)
-
-        return opt, opt_l
+        loss += batch_loss
+        err += data_loss
+        del pair_batch, out, data_loss, batch_loss
+    loss /= batches
+    err /= batches
+    return loss, err
 
 
 def test_step():
     model.eval()
     with torch.no_grad():
         test_err = 0
-        batch_loss = 0
-        for pair_batch in iter(train_loader):
-            pair_batch = pair_batch.to(device)
-            x_in = 2 * (pair_batch.x_2 - x_min) / (x_max - x_min) - 1
-            out = model(
-                x_in,
-                pair_batch.edge_index_2,
-                pair_batch.pos_2,
-                pool_structures,
-            )
-            loss = loss_fn(out, pair_batch.x_3)
-            batch_loss += loss
-        batch_loss /= batches
         for pair_batch in iter(test_loader):
+        # for pair_batch in iter(train_loader):
             pair_batch = pair_batch.to(device)
-            x_in = 2 * (pair_batch.x_2 - x_min) / (x_max - x_min) - 1
+            x_in = pair_batch.x_2
+            if len(x_in.shape) == 1:
+                x_in = x_in.reshape((pair_batch.pos_2.size(0), 5))
+            x_in = 2 * (x_in - x_min) / (x_max - x_min) - 1
+
             out = model(
                 x_in,
                 pair_batch.edge_index_2,
                 pair_batch.pos_2,
                 pool_structures,
+                parts,
+                pnp,
             )
             batch_loss = loss_fn(out, pair_batch.x_3)
             test_err += batch_loss
         test_err /= test_batches
-    return batch_loss, test_err
+    return test_err
 
 
-def main(n_epochs, opt, opt_l):
+def main(n_epochs):
     min_err = torch.inf
     save = os.path.join(save_path, "model_init")
-    lbfgs = False
-    first = True
     if debug:
         print("Train")
     for epoch in range(n_epochs):
-        # lr = sch._last_lr[0]
-        opt, opt_l = train_step(opt, opt_l, lbfgs)
-        loss, test_err  = test_step()
-        lbfgs = loss < 0.5
+        lr = sch._last_lr[0]
+        loss, train_err = train_step()
+        test_err = test_step()
         sch.step()
-        if lbfgs:
-            if not first:
-                sch_l.step()
-            else:
-                first = False
 
         if debug:
             print(
                 "Loss {:g}, Error {:g} / {:g}, Epoch {:g},".format(
-                    loss, loss, test_err, epoch
+                    loss, train_err, test_err, epoch
                 )
             )
         if epoch % 10 == 0 or epoch == n_epochs - 1:
@@ -323,7 +372,7 @@ def main(n_epochs, opt, opt_l):
                 wandb.log(
                     {
                         "Loss": loss,
-                        "Train Error": loss,
+                        "Train Error": train_err,
                         "Test Error": test_err,
                         "Epoch": epoch,
                     }
@@ -352,4 +401,4 @@ if __name__ == "__main__":
             name=case_name,
             settings=wandb.Settings(_disable_stats=True),
         )
-    main(n_epochs, opt, opt_l)
+    main(n_epochs)

@@ -20,7 +20,7 @@ parser.add_argument(
 )
 parser.add_argument("--channels", default=32, type=int, help="Aggregation Channels")
 parser.add_argument(
-    "--latent-sz", default=16, type=int, help="Latent Space Dimensionality"
+    "--latent-sz", default=32, type=int, help="Latent Space Dimensionality"
 )
 parser.add_argument(
     "--siren-layers", default=1, type=int, help="Number of SIREN Layers"
@@ -32,7 +32,7 @@ parser.add_argument(
     "--pooling-layers", default=1, type=int, help="Number of Pooling Layers"
 )
 parser.add_argument("--batch-sz", default=1, type=int, help="Batch Size")
-parser.add_argument("--learning-rate", default=1e-4, type=float, help="Learning Rate")
+parser.add_argument("--learning-rate", default=1e-5, type=float, help="Learning Rate")
 parser.add_argument("--coarse", default=1, type=int, help="Coarse (1) or Fine (0)")
 parser.add_argument("--slices", default=5, type=int, help="Number of Input Slices")
 parser.add_argument("--wandb", default=1, type=int, help="wandb upload")
@@ -40,8 +40,8 @@ parser.add_argument("--gpu-id", default=0, type=int, help="GPU index")
 parser.add_argument("--mach", default=0.3, type=float, help="Mach Number")
 parser.add_argument("--reynolds", default=3e6, type=float, help="Reynolds Number")
 parser.add_argument("--aoa", default=3.0, type=float, help="Angle of Attack")
-parser.add_argument("--date", default="051023", type=str, help="Date of run in ddmmyy")
-parser.add_argument("--epoch", default=7, type=int, help="Checkpoint Epoch")
+parser.add_argument("--date", default="071023", type=str, help="Date of run in ddmmyy")
+parser.add_argument("--epoch", default=475, type=int, help="Checkpoint Epoch")
 
 args = parser.parse_args()
 case_name = "_".join(
@@ -130,7 +130,7 @@ def main(save_path):
 
     model.eval()
     with torch.no_grad():
-        pair = next(iter(recon_loader))
+        pair = next(iter(recon_loader)).to(device)
         pool_structures = torch.load(
             os.path.join(
                 pool_path,
@@ -146,7 +146,7 @@ def main(save_path):
                 pool_structures[key] = item.to(device)
             elif type(item) == list:
                 pool_structures[key] = [i.to(device) for i in item]
-        x_in = 2 * (pair.x_2 - x_min) / (x_max - x_min) - 1
+        x_in = 2 * (pair.x_2.reshape((pair.pos_2.size(0), 5)) - x_min) / (x_max - x_min) - 1
         f_recon = model(
             x_in,
             pair.edge_index_2,

@@ -4,7 +4,9 @@ TestCase
 argument_files*
 db-env
 *.vtk
-data
+data/coarse
+data/fine
+data/models_save
 *.tar*
 *.sif
 __pycache__

@@ -118,23 +118,24 @@ class PairDataset(InMemoryDataset):
                         slice_szs.append(sz)
 
                     # add slice with freestream condition everywhere
-                    slice_idx.append(slice_idx[-1])
-                    slice_szs.append(slice_szs[-1])
+                    # slice_idx.append(slice_idx[-1])
+                    # slice_szs.append(slice_szs[-1])
 
-                    fs_slice_coords = slice_coords[-1]
-                    fs_slice_coords[:,1] = 1.2
-                    slice_coords.append(fs_slice_coords)
+                    # fs_slice_coords = slice_coords[-1]
+                    # fs_slice_coords[:,1] = 1.5
+                    # slice_coords.append(fs_slice_coords)
 
-                    u_inf = ma*c
-                    rho_inf = mu * re / (u_inf * l)
-                    p_inf = rho_inf*r_air*t_inf
-                    nrg_inf = (p_inf / (gam-1) / rho_inf) + 0.5*u_inf**2
+                    # u_inf = ma*c
+                    # rho_inf = mu * re / (u_inf * l)
+                    # p_inf = rho_inf*r_air*t_inf
+                    # nrg_inf = (p_inf / (gam-1) / rho_inf) + 0.5*u_inf**2
 
-                    fs_data = rho_inf * np.array([1,u_inf,0,0,nrg_inf])
-                    fs_data = np.tile(fs_data,(slice_szs[-1],1))
+                    # fs_data = rho_inf * np.array([1,u_inf,0,0,nrg_inf])
+                    # fs_data = np.tile(fs_data,(slice_szs[-1],1))
 
-                    slice_data.append(fs_data)
+                    # slice_data.append(fs_data)
 
+                    # combine slices
                     idx, features_2, sz = combine(slice_idx, slice_data, slice_szs)
                     coords = np.concatenate(slice_coords, axis=0)
 

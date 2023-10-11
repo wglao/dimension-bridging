@@ -12,7 +12,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument(
     "--case-name", default="dbed-siren", type=str, help="Architecture Name"
 )
-parser.add_argument("--channels", default=64, type=int, help="Aggregation Channels")
+parser.add_argument("--enc-channels", default=32, type=int, help="Aggregation Channels")
+parser.add_argument("--siren-width", default=256, type=int, help="SIREN Layer Width")
 parser.add_argument(
     "--latent-sz", default=16, type=int, help="Latent Space Dimensionality"
 )
@@ -50,8 +51,9 @@ from torch_geometric.utils import to_networkx
 from torch_geometric.nn.pool import avg_pool_neighbor_x
 import torch.nn.functional as F
 
-from models_dbed import DBED
+from models_dbed import DBED, DBEDParts
 from graphdata import PairData, PairDataset
+
 # from pool_and_part import pnp
 
 if debug:
@@ -72,25 +74,57 @@ if args.coarse:
     coarse_fine = "coarse"
 else:
     coarse_fine = "fine"
-data_path = os.path.join(
-    os.environ["SCRATCH"], "ORNL/dimension-bridging/data"
-)
+data_path = os.path.join(os.environ["SCRATCH"], "ORNL/dimension-bridging/data")
 if wandb_upload:
     train_dataset = PairDataset(
-        data_path, ma_list, re_list, aoa_list, "train_" + coarse_fine + "_{:d}s".format(n_slices), n_slices
+        data_path,
+        ma_list,
+        re_list,
+        aoa_list,
+        "train_" + coarse_fine + "_{:d}s".format(n_slices),
+        n_slices,
     )
     test_dataset = PairDataset(
-        data_path, ma_list, [4e6, 7e6, 1e7], aoa_list, "test_" + coarse_fine + "_{:d}s".format(n_slices), n_slices
+        data_path,
+        ma_list,
+        [4e6, 7e6, 1e7],
+        aoa_list,
+        "test_" + coarse_fine + "_{:d}s".format(n_slices),
+        n_slices,
     )
 else:
-    train_dataset = PairDataset(
-        data_path, [0.3, 0.4], [3e6, 4e6], [3, 4], "idev-train_" + coarse_fine + "_{:d}s".format(n_slices), n_slices
-    )
+    # train_dataset = PairDataset(
+    #     data_path,
+    #     [0.3, 0.4],
+    #     [3e6, 4e6],
+    #     [3, 4],
+    #     "idev-train_" + coarse_fine + "_{:d}s".format(n_slices),
+    #     n_slices,
+    # )
+    # test_dataset = PairDataset(
+    #     data_path,
+    #     [0.5, 0.6],
+    #     [5e6, 6e6],
+    #     [5, 6],
+    #     "idev-test_" + coarse_fine + "_{:d}s".format(n_slices),
+    #     n_slices,
+    # )
     test_dataset = PairDataset(
-        data_path, [0.5, 0.6], [5e6, 6e6], [5, 6], "idev-test_" + coarse_fine + "_{:d}s".format(n_slices), n_slices
+        data_path,
+        [0.3],
+        [3e6],
+        [3],
+        "recon3_" + coarse_fine + "_{:d}s".format(n_slices),
+        n_slices,
     )
-    # train_dataset = PairDataset(data_path, [0.3], [3e6], [3], "recon3_" + coarse_fine + "_{:d}s".format(n_slices), n_slices)
-    # test_dataset = PairDataset(data_path, [0.3], [3e6], [3], "recon3_" + coarse_fine + "_{:d}s".format(n_slices), n_slices)
+    train_dataset = PairDataset(
+        data_path,
+        [0.6],
+        [6e6],
+        [6],
+        "recon6_" + coarse_fine + "_{:d}s".format(n_slices),
+        n_slices,
+    )
 
 
 n_samples = len(train_dataset)
@@ -103,7 +137,7 @@ test_batches = -(n_test // -test_sz)
 train_loader = DataLoader(train_dataset, batch_sz, follow_batch=["x_3", "x_2"])
 test_loader = DataLoader(test_dataset, test_sz, follow_batch=["x_3", "x_2"])
 
-init_data = next(iter(test_loader))
+init_data = next(iter(train_loader))
 init_data = init_data[0].to(device)
 
 pool_path = os.path.join(
@@ -117,7 +151,13 @@ saved_pool = bool(
         glob.glob(
             os.path.join(
                 pool_path,
-                "pool_{:d}layers_".format(args.pooling_layers) + coarse_fine + ".pt",
+                "_".join(
+                    (
+                        "pool_{:d}layers".format(args.pooling_layers),
+                        coarse_fine,
+                        "{:d}s.pt".format(n_slices),
+                    )
+                ),
             )
         )
     )
@@ -132,7 +172,13 @@ else:
     pool_structures = torch.load(
         os.path.join(
             pool_path,
-            "pool_{:d}layers_".format(args.pooling_layers) + coarse_fine + ".pt",
+            "_".join(
+                (
+                    "pool_{:d}layers".format(args.pooling_layers),
+                    coarse_fine,
+                    "{:d}s.pt".format(n_slices),
+                )
+            ),
         )
     )
     for key in pool_structures.keys():
@@ -141,11 +187,46 @@ else:
             pool_structures[key] = item.to(device)
         elif type(item) == list:
             pool_structures[key] = [i.to(device) for i in item]
+if debug:
+    print("Loading 3D partitions")
+parts = torch.load(
+    os.path.join(
+        pool_path,
+        "_".join(
+            (
+                "parts_{:d}layers".format(args.pooling_layers),
+                coarse_fine,
+                "{:d}s.pt".format(n_slices),
+            )
+        ),
+    )
+)
+parts = [part.to(device) for part in parts]
+
+pnp = torch.load(
+    os.path.join(
+        pool_path,
+        "_".join(
+            (
+                "pnp_{:d}layers".format(args.pooling_layers),
+                coarse_fine,
+                "{:d}s.pt".format(n_slices),
+            )
+        ),
+    )
+)
+for p in range(len(pnp)):
+    for key in pnp[p].keys():
+        item = pnp[p][key]
+        if type(item) == torch.Tensor:
+            pnp[p][key] = item.to(device)
+        elif type(item) == list:
+            pnp[p][key] = [i.to(device) for i in item]
 
 if debug:
     print("Init")
 
-n_epochs = 10000
+n_epochs = 100000
 eps = 1e-15
 
 with torch.no_grad():
@@ -156,22 +237,31 @@ with torch.no_grad():
 
     for d in iter(train_loader):
         x = d.x_2.to(device)
-        x_min = torch.where(x.min(dim=0).values < x_min, x.min(dim=0).values, x_min).to(device)
-        x_max = torch.where(x.max(dim=0).values > x_max, x.max(dim=0).values, x_max).to(device)
+        x_min = torch.where(x.min(dim=0).values < x_min, x.min(dim=0).values, x_min).to(
+            device
+        )
+        x_max = torch.where(x.max(dim=0).values > x_max, x.max(dim=0).values, x_max).to(
+            device
+        )
 
     x_init = 2 * (init_data.x_2 - x_min) / (x_max - x_min) - 1
 
-    # # outputs linearly dependent
-    out_szs = [5,]
-    # # outputs linearly independent
-    # out_szs = [1,1,1,1,1]
-
+    # model = DBEDParts(
+    #     args.enc_channels,
+    #     args.siren_width,
+    #     args.latent_sz,
+    #     5,
+    #     args.siren_layers,
+    #     args.pooling_layers,
+    #     args.omega,
+    #     device,
+    # ).to(device)
     model = torch.jit.trace(
         DBED(
-            init_data,
-            args.channels,
+            args.enc_channels,
+            args.siren_width,
             args.latent_sz,
-            out_szs,
+            5,
             args.siren_layers,
             args.pooling_layers,
             args.omega,
@@ -180,7 +270,7 @@ with torch.no_grad():
         (x_init, init_data.edge_index_2, init_data.pos_2, pool_structures),
     )
 opt = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-sch = torch.optim.lr_scheduler.LinearLR(opt, 1, 1e-2, 1000)
+sch = torch.optim.lr_scheduler.LinearLR(opt, 1, 1e-2, 2000)
 # sch = torch.optim.lr_scheduler.ExponentialLR(opt,args.decay)
 # plat = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5)
 loss_fn = torch.nn.MSELoss()
@@ -209,6 +299,8 @@ def train_step():
             pair_batch.edge_index_2,
             pair_batch.pos_2,
             pool_structures,
+            # parts,
+            # pnp
         )
 
         # in case of additional loss terms
@@ -237,6 +329,8 @@ def test_step():
                 pair_batch.edge_index_2,
                 pair_batch.pos_2,
                 pool_structures,
+                # parts,
+                # pnp
             )
             batch_loss = loss_fn(out, pair_batch.x_3)
             test_err += batch_loss
