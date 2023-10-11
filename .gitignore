@@ -7,6 +7,7 @@ db-env
 data/coarse
 data/fine
 data/models_save
+*.pt
 *.tar*
 *.sif
 __pycache__
