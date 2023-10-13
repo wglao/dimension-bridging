@@ -12,13 +12,13 @@ parser = argparse.ArgumentParser()
 parser.add_argument(
     "--case-name", default="dbed-siren", type=str, help="Architecture Name"
 )
-parser.add_argument("--enc-channels", default=32, type=int, help="Aggregation Channels")
-parser.add_argument("--siren-width", default=256, type=int, help="SIREN Layer Width")
+parser.add_argument("--enc-channels", default=48, type=int, help="Aggregation Channels")
+parser.add_argument("--siren-width", default=512, type=int, help="SIREN Layer Width")
 parser.add_argument(
-    "--latent-sz", default=16, type=int, help="Latent Space Dimensionality"
+    "--latent-sz", default=512, type=int, help="Latent Space Dimensionality"
 )
 parser.add_argument(
-    "--siren-layers", default=1, type=int, help="Number of SIREN Layers"
+    "--siren-layers", default=3, type=int, help="Number of SIREN Layers"
 )
 parser.add_argument("--omega", default=1.0, type=float, help="Omega0 for SIREN Layers")
 parser.add_argument(
@@ -27,7 +27,7 @@ parser.add_argument(
 parser.add_argument("--batch-sz", default=1, type=int, help="Batch Size")
 parser.add_argument("--learning-rate", default=1e-4, type=float, help="Learning Rate")
 parser.add_argument("--coarse", default=1, type=int, help="Coarse or Fine")
-parser.add_argument("--slices", default=5, type=int, help="Number of Input 2D slices")
+parser.add_argument("--slices", default=1, type=int, help="Number of Input 2D slices")
 parser.add_argument("--wandb", default=0, type=int, help="wandb upload")
 parser.add_argument("--debug", default=0, type=bool, help="debug prints")
 parser.add_argument("--gpu-id", default=0, type=int, help="GPU index")
@@ -109,7 +109,7 @@ else:
     #     "idev-test_" + coarse_fine + "_{:d}s".format(n_slices),
     #     n_slices,
     # )
-    test_dataset = PairDataset(
+    train_dataset = PairDataset(
         data_path,
         [0.3],
         [3e6],
@@ -117,7 +117,7 @@ else:
         "recon3_" + coarse_fine + "_{:d}s".format(n_slices),
         n_slices,
     )
-    train_dataset = PairDataset(
+    test_dataset = PairDataset(
         data_path,
         [0.6],
         [6e6],
@@ -270,7 +270,7 @@ with torch.no_grad():
         (x_init, init_data.edge_index_2, init_data.pos_2, pool_structures),
     )
 opt = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-sch = torch.optim.lr_scheduler.LinearLR(opt, 1, 1e-2, 2000)
+sch = torch.optim.lr_scheduler.LinearLR(opt, 1, 1e-2, 500)
 # sch = torch.optim.lr_scheduler.ExponentialLR(opt,args.decay)
 # plat = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5)
 loss_fn = torch.nn.MSELoss()
@@ -347,7 +347,7 @@ def main(n_epochs):
         lr = sch._last_lr[0]
         loss, train_err = train_step()
         test_err = test_step()
-        sch.step()
+        # sch.step()
 
         if debug:
             print(

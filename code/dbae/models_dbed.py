@@ -2,7 +2,7 @@ import math
 import torch
 from functools import partial
 from torch import Tensor
-from torch_geometric.nn.aggr import Aggregation
+from torch_geometric.nn.aggr import Aggregation, MedianAggregation, QuantileAggregation
 from torch_geometric.typing import (
     Adj,
     OptPairTensor,
@@ -203,30 +203,81 @@ class KernelMLP(nn.Module):
 
     def forward(self, rel_pos, channel: int = 0):
         # # Convert to spherical [rho, theta, phi] = [r, az, elev]
-        rho = torch.norm(rel_pos, dim=1).to(self.device)
-        theta = torch.atan2(rel_pos[:, 1], rel_pos[:, 0]).to(self.device)
-        phi = torch.asin(rel_pos[:, 2] / rho).to(self.device)
-        theta = torch.where(phi.isnan(), torch.zeros_like(theta), theta)
-        phi = torch.where(phi.isnan(), torch.zeros_like(phi), phi)
+        # rho = torch.norm(rel_pos, dim=1).to(self.device)
+        # theta = torch.atan2(rel_pos[:, 1], rel_pos[:, 0]).to(self.device)
+        # phi = torch.asin(rel_pos[:, 2] / rho).to(self.device)
+        # theta = torch.where(phi.isnan(), torch.zeros_like(theta), theta)
+        # phi = torch.where(phi.isnan(), torch.zeros_like(phi), phi)
 
         # # scale [rho, theta, phi] to [-1,1]^3
         # graphs are static, so can scale here instead of outside the loop
-        rho = (
+        # rho = (
+        #     2
+        #     * (rho - rho.min(dim=0).values)
+        #     / (rho.max(dim=0).values - rho.min(dim=0).values)
+        #     - 1
+        # )
+        # theta = theta / torch.pi
+        # phi = 2 * phi / torch.pi
+        # rel_pos = torch.stack((rho, theta, phi), dim=1)
+        rel_pos = (
             2
-            * (rho - rho.min(dim=0).values)
-            / (rho.max(dim=0).values - rho.min(dim=0).values)
+            * (rel_pos - rel_pos.min(dim=0).values)
+            / (rel_pos.max(dim=0).values - rel_pos.min(dim=0).values)
             - 1
         )
-        theta = theta / torch.pi
-        phi = 2 * phi / torch.pi
-        rel_pos = torch.stack(
-            (rho, theta, phi, torch.full_like(rho, 2 * channel / self.in_sz - 1)), dim=1
+        # catch nans caused by slice input
+        rel_pos = torch.where(
+            rel_pos.isnan(), torch.zeros_like(rel_pos.to(self.device)), rel_pos
         )
-        out = self.sin0(rel_pos)
+        inputs = torch.cat(
+            (
+                # pos,
+                rel_pos,
+                torch.full((rel_pos.size(0), 1), 2 * channel / self.in_sz - 1).to(
+                    self.device
+                ),
+            ),
+            dim=1,
+        )
+        out = self.sin0(inputs)
         for s in self.sin_list:
             out = s(out)
         out = self.lin(out)
         return out
+
+
+class DualVolCalc(MessagePassing):
+    def __init__(self, **kwargs):
+        kwargs.setdefault("aggr", "mean")
+        super(DualVolCalc, self).__init__(**kwargs)
+
+    def forward(self, x, edge_index, pos):
+        # edge_index, _ = add_remaining_self_loops(edge_index)
+        rel_pos = get_edge_attr(edge_index, pos)
+        edge_weight = torch.norm(rel_pos, 2, 1).unsqueeze(1) / 2
+        edge_weight = edge_weight.squeeze()
+        out = self.propagate(edge_index, x=x, edge_weight=edge_weight, size=None)
+        # approximate dual cell volume with sphere of radius 1/2 mean edge length
+
+        if len(out.shape) > 2:
+            out = out.squeeze(2)
+        out = 4 / 3 * torch.pi * out**3
+        return out
+
+    def message_calc(self, edge_weight: Tensor):
+        msg = edge_weight
+        return msg
+
+    def message(self, x_j: Tensor, edge_weight: OptTensor) -> Tensor:
+        if edge_weight is None:
+            msg = 0
+            return msg
+        else:
+            return self.message_calc(edge_weight).unsqueeze(1)
+
+    def message_and_aggregate(self, adj_t: SparseTensor, x: Tensor) -> Tensor:
+        return spmm(adj_t, x, reduce=self.aggr)
 
 
 class GraphKernelConv(MessagePassing):
@@ -242,8 +293,8 @@ class GraphKernelConv(MessagePassing):
         device: str = "cpu",
         **kwargs
     ):
-        kwargs.setdefault("aggr", "add")
-        super(GraphKernelConv, self).__init__()
+        kwargs.setdefault("aggr", "sum")
+        super(GraphKernelConv, self).__init__(**kwargs)
         self.dim = dim
         self.in_channels = in_channels
         self.hidden_channels = hidden_channels
@@ -259,6 +310,8 @@ class GraphKernelConv(MessagePassing):
             omega=omega,
             device=device,
         ).to(device)
+        # self.dvc = DualVolCalc(aggr=QuantileAggregation(0.5).to(device)).to(device)
+        self.dvc = DualVolCalc(aggr="mean").to(device)
 
         self.bias = Parameter(torch.Tensor(1, out_channels)).to(device)
 
@@ -272,28 +325,30 @@ class GraphKernelConv(MessagePassing):
 
     def forward(self, x, edge_index, pos):
         # x = F.selu(self.lin0(x), inplace=True)
+        vol = self.dvc(torch.ones_like(x).to(self.device), edge_index, pos)
+        x = x * vol
         edge_index, _ = add_remaining_self_loops(edge_index)
         rel_pos = get_edge_attr(edge_index, pos)
-        out = self.propagate(edge_index, x=x, edge_weight=rel_pos, size=None)
+        out = self.propagate(edge_index, x=x, vol=vol, edge_weight=rel_pos, size=None)
         if len(out.shape) > 2:
             out = out.squeeze(2)
         out += self.bias
         return out
 
-    def message_calc(self, x_j: Tensor, rel_pos: Tensor, channel: int = 0):
+    def message_calc(self, x_j: Tensor, vol: Tensor, rel_pos: Tensor, channel: int = 0):
         msg = self.k_net(rel_pos, channel) * x_j
         return msg.sum(1)
 
-    def message(self, x_j: Tensor, edge_weight: OptTensor) -> Tensor:
+    def message(self, x_j: Tensor, vol: OptTensor, edge_weight: OptTensor) -> Tensor:
         if edge_weight is None:
             msg = x_j
         else:
             if self.out_channels > 1:
                 msg = []
                 for i in range(self.out_channels):
-                    msg.append(self.message_calc(x_j, edge_weight, i))
+                    msg.append(self.message_calc(x_j, vol, edge_weight, i))
                 return torch.stack(msg, 1).to(self.device)
-            return self.message_calc(x_j, edge_weight, 1).unsqueeze(1)
+            return self.message_calc(x_j, vol, edge_weight, 1).unsqueeze(1)
 
     def message_and_aggregate(self, adj_t: SparseTensor, x: Tensor) -> Tensor:
         return spmm(adj_t, x, reduce=self.aggr)
@@ -443,24 +498,36 @@ class Encoder(nn.Module):
         self.conv_list = nn.ModuleList([])
         # pools
         self.pool_list = nn.ModuleList()
-        # self.conv_list.append(
-        #         GraphKernelConv(
-        #             dim,
-        #             hidden_channels,
-        #             hidden_channels,
-        #             hidden_channels,
-        #             # k_net = KernelMLP,
-        #             # k_net_layers = k_net_layers,
-        #             omega=omega,
-        #             device=device,
-        #         ).to(self.device)
-        #     )
+        self.conv_list.append(
+            GraphKernelConv(
+                dim,
+                hidden_channels,
+                hidden_channels,
+                hidden_channels,
+                # k_net = KernelMLP,
+                # k_net_layers = k_net_layers,
+                omega=omega,
+                device=device,
+            ).to(self.device)
+        )
         for _ in range(n_pools):
             self.conv_list.append(
                 GraphKernelConv(
                     dim,
                     hidden_channels,
                     knet_width,
+                    hidden_channels,
+                    # k_net = KernelMLP,
+                    # k_net_layers = k_net_layers,
+                    omega=omega,
+                    device=device,
+                ).to(self.device)
+            )
+            self.conv_list.append(
+                GraphKernelConv(
+                    dim,
+                    hidden_channels,
+                    hidden_channels,
                     hidden_channels,
                     # k_net = KernelMLP,
                     # k_net_layers = k_net_layers,
@@ -500,15 +567,17 @@ class Encoder(nn.Module):
     ):
         x = self.sin0(x)
         x = torch.sin(self.omega * (self.conv0(x, edge_index, pos)))
+        x = torch.sin(self.omega * (self.conv_list[0](x, edge_index, pos)))
 
         # for l, pool in enumerate(self.pool_list):
         # for l in range(self.n_pools):
-        for l, conv in enumerate(self.conv_list):
+        for l in range(self.n_pools):
             keep_idx = pool_keep_idx[l]
             x = self.max_pool(x, edge_index, keep_idx)
             edge_index = pool_edge_index[l + 1]
             pos = pool_pos[l + 1]
-            x = torch.sin(self.omega * (conv(x, edge_index, pos)))
+            x = torch.sin(self.omega * (self.conv_list[2*l + 1](x, edge_index, pos)))
+            x = torch.sin(self.omega * (self.conv_list[2*l + 2](x, edge_index, pos)))
 
         x = self.lin1(x)
         x = x.max(dim=0).values
@@ -569,7 +638,7 @@ class DBED(nn.Module):
         channels,
         hidden_sz,
         latent_sz,
-        out_szs,
+        out_sz,
         layers,
         n_pools,
         omega: float = 30.0,
@@ -581,7 +650,7 @@ class DBED(nn.Module):
         self.channels = channels
         self.hidden_sz = hidden_sz
         self.latent_sz = latent_sz
-        self.out_szs = out_szs
+        self.out_sz = out_sz
         self.layers = layers
         self.n_pools = n_pools
         self.omega = omega
@@ -592,7 +661,7 @@ class DBED(nn.Module):
             self.dim, self.in_sz, channels, channels * 2, latent_sz, 1, omega, device
         )
         self.dec = ModSIREN(
-            self.dim, latent_sz, hidden_sz, out_szs, layers, omega, device
+            self.dim, latent_sz, hidden_sz, out_sz, layers, omega, device
         )
 
         self.reset_parameters()
@@ -615,7 +684,7 @@ class DBED(nn.Module):
         )
 
         # z = onera_interp(z, pool_structures["p2"][-1], pos_3)
-        z = z*torch.ones((pos_3.size(0),self.latent_sz)).to(self.device)
+        z = z * torch.ones((pos_3.size(0), self.latent_sz)).to(self.device)
 
         # for part in parts:
         #     z[part.old_idx] = knn_interpolate(z,pos,part.pos,k=1)
