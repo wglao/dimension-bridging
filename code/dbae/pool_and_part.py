@@ -2,14 +2,14 @@ import os
 import sys
 import glob
 import scipy.sparse as sp
-from datetime import date
+# from datetime import date
 import shutil
 from functools import partial
 import argparse
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
-    "--part", default=0, type=int, help="Partition (1) or Pool Only (0)"
+    "--pool", default=0, type=int, help="Partition Only (0) or Pool and Part (1)"
 )
 parser.add_argument(
     "--pooling-layers", default=1, type=int, help="Number of Pooling Layers"
@@ -26,8 +26,7 @@ parser.add_argument("--gpu-id", default=0, type=int, help="GPU index")
 args = parser.parse_args()
 wandb_upload = bool(args.wandb)
 debug = True if not wandb_upload else args.debug
-part = bool(args.part)
-today = date.today()
+# today = date.today()
 case_name = "_".join(
     [str(key) + "-" + str(value) for key, value in list(vars(args).items())[:-2]]
 )[10:]
@@ -164,7 +163,7 @@ with torch.no_grad():
             for j in range(rows[i], rows[i + 1]):
                 edges.append((i, cols[j]))
 
-        return torch.tensor(edges).transpose(0, 1).int()
+        return torch.tensor(edges).transpose(0, 1)
 
     def decimation_pool(x, edge_index, pos):
         n_nodes = x.size(0)
@@ -178,8 +177,10 @@ with torch.no_grad():
             (n_nodes, n_nodes),
         )
         adj_list = [adj]
+        sp_list = [adj]
         pos_list = [pos]
         keep_list = []
+        edge_index_list = []
 
         for l in range(args.pooling_layers):
             if debug:
@@ -227,13 +228,13 @@ with torch.no_grad():
 
             pos = pos[keep_idx]
             pos_list.append(pos)
+            x = x[keep_idx]
 
-        sp_list = [adj_list[0]]
-        for adj in adj_list[1:]:
-            adj = (adj * np.abs(adj)) > 1e-1
-            sp_list.append(adj)
-
-        edge_index_list = [get_edge_list(adj) for adj in sp_list]
+            # sp_list = [adj_list[0]]
+            adj_sp = (adj_new * np.abs(adj_new)) > 1e-1
+            sp_list.append(adj_sp)
+            edge_index = get_edge_list(adj_sp)
+            edge_index_list.append(edge_index)
         return edge_index_list, pos_list, keep_list
 
     def partition(y_cut: torch.Tensor, x, edge_index, pos, ghost: bool = False):
@@ -340,11 +341,13 @@ with torch.no_grad():
 
 
 if __name__ == "__main__":
-    # pool(init_data)
+    if args.pool == 1:
+        pool(init_data)
     # get partitions
-    ys = init_data.pos_2[:, 1].unique().to(device)
+    ys = init_data.pos_2[:, 1].unique()
     y_cuts = torch.cat((torch.tensor([0]).to(device), torch.diff(ys) / 2 + ys[:-1]))
     parts = []
+    print("Parting")
     part_fn = partial(
         partition,
         x=init_data.x_3,
